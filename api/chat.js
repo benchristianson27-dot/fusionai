@@ -1,3 +1,5 @@
+import { verifyAuth } from './auth.js';
+
 export const config = {
   maxDuration: 60,
 };
@@ -9,7 +11,11 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { prompt, history, tier, mode, fileData } = req.body;
+  const { prompt, history, tier: clientTier, mode, fileData } = req.body;
+  
+  // Server-side auth - verify token and get real tier from Firestore
+  const auth = await verifyAuth(req);
+  const tier = auth.tier; // ALWAYS use server-side tier, never trust client
   if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
 
   const KEYS = {
