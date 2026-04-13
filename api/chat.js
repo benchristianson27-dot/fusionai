@@ -139,7 +139,10 @@ async function callClaude(p, model, hist, key, sys) {
   if (!key) throw new Error('No key');
   const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: 2048, system: sys, messages: hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: p }]) }) });
   if (!r.ok) { let errMsg='Claude error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
-  return (await r.json()).content?.map(b => b.text || '').join('') || '';
+  var cData = await r.json();
+  var cText = (cData.content || []).map(b => b.text || '').join('');
+  if (!cText || cText.trim().length < 5) throw new Error('Claude returned empty - may have been filtered');
+  return cText;
 }
 async function callOpenAI(p, model, hist, key, sys) {
   if (!key) throw new Error('No OpenAI key configured');
