@@ -74,7 +74,17 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
   const results = await Promise.allSettled([
     withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 30000, 'Claude'),
     withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 30000, 'ChatGPT'),
-    withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 30000, 'Gemini'),
+    withTimeout(
+      callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt)
+        .catch(function(e) {
+          // Fallback to gemini-2.0-flash if primary model is overloaded
+          if (e.message && (e.message.includes('high demand') || e.message.includes('overloaded') || e.message.includes('503') || e.message.includes('UNAVAILABLE'))) {
+            console.log('Gemini primary failed, falling back to gemini-2.0-flash');
+            return callGemini(fullPrompt, 'gemini-2.0-flash', convHistory, KEYS.gemini, systemPrompt);
+          }
+          throw e;
+        }),
+      30000, 'Gemini'),
     withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 30000, 'Grok'),
   ]);
 
