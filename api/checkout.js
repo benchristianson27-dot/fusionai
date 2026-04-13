@@ -1,4 +1,5 @@
 import Stripe from 'stripe';
+import { verifyAuth } from './auth.js';
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -9,7 +10,13 @@ export default async function handler(req, res) {
 
   const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-  const { tier, userEmail, userId } = req.body;
+  // Verify the user is actually signed in
+  const user = await verifyAuth(req);
+  if (!user.authenticated) return res.status(401).json({ error: 'Sign in required to upgrade' });
+  
+  const { tier } = req.body;
+  const userEmail = user.email; // Use verified email, not client-supplied
+  const userId = user.uid;
   if (!tier || !userEmail) return res.status(400).json({ error: 'Missing tier or email' });
 
   const PRICES = {
