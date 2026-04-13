@@ -71,23 +71,11 @@ function withTimeout(promise, ms, name) {
 
 const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
 
-  // Call all 4 models - 25s timeout, quick retry on server errors only
-  async function callWithRetry(fn, args, name) {
-    try {
-      return await withTimeout(fn(...args), 25000, name);
-    } catch (e) {
-      if (e.message.includes('500') || e.message.includes('502') || e.message.includes('503') || e.message.includes('529')) {
-        return await withTimeout(fn(...args), 15000, name);
-      }
-      throw e;
-    }
-  }
-  
   const results = await Promise.allSettled([
-    callWithRetry(callClaude, [fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt], 'Claude'),
-    callWithRetry(callOpenAI, [fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt], 'ChatGPT'),
-    callWithRetry(callGemini, [fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt], 'Gemini'),
-    callWithRetry(callGrok, [fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt], 'Grok'),
+    withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 30000, 'Claude'),
+    withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 30000, 'ChatGPT'),
+    withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 30000, 'Gemini'),
+    withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 30000, 'Grok'),
   ]);
 
   const successful = [], failed = [];
@@ -113,7 +101,7 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
     if (activeMode === 'thinking') synthInst += ' Preserve step-by-step reasoning.';
     if (activeMode === 'search') synthInst += ' Prioritize the most recent info.';
     const synthPrompt = synthInst + '\n\nQuestion: "' + prompt + '"\n\n' + successful.map((r, i) => '=== Response ' + (i+1) + ' ===\n' + r.text).join('\n\n') + '\n\nBest synthesized answer:';
-    try { finalReply = await callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst); }
+    try { finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 25000, 'Synthesis'); }
     catch (e) { finalReply = successful[0].text; synthesized = false; }
   }
 
