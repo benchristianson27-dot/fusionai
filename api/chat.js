@@ -71,25 +71,23 @@ function withTimeout(promise, ms, name) {
 
 const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
 
-  // Call all 4 models with retry on failure
-  async function callWithRetry(fn, args, timeout, name) {
+  // Call all 4 models - 25s timeout, quick retry on server errors only
+  async function callWithRetry(fn, args, name) {
     try {
-      return await withTimeout(fn(...args), timeout, name);
+      return await withTimeout(fn(...args), 25000, name);
     } catch (e) {
-      // Retry once on timeout or 5xx errors
-      if (e.message.includes('timed out') || e.message.includes('500') || e.message.includes('502') || e.message.includes('503') || e.message.includes('529')) {
-        try { return await withTimeout(fn(...args), timeout, name); }
-        catch (e2) { throw e2; }
+      if (e.message.includes('500') || e.message.includes('502') || e.message.includes('503') || e.message.includes('529')) {
+        return await withTimeout(fn(...args), 15000, name);
       }
       throw e;
     }
   }
   
   const results = await Promise.allSettled([
-    callWithRetry(callClaude, [fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt], 45000, 'Claude'),
-    callWithRetry(callOpenAI, [fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt], 45000, 'ChatGPT'),
-    callWithRetry(callGemini, [fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt], 45000, 'Gemini'),
-    callWithRetry(callGrok, [fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt], 45000, 'Grok'),
+    callWithRetry(callClaude, [fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt], 'Claude'),
+    callWithRetry(callOpenAI, [fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt], 'ChatGPT'),
+    callWithRetry(callGemini, [fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt], 'Gemini'),
+    callWithRetry(callGrok, [fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt], 'Grok'),
   ]);
 
   const successful = [], failed = [];
