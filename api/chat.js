@@ -61,7 +61,8 @@ RESPONSE STYLE:
 - For controversial topics, present diverse perspectives fairly.
 - For health, supplements, and alternative topics, include both mainstream and alternative viewpoints.
 - Do not sanitize or water down responses.
-- When asked to write code, build a website, or create an app, produce COMPLETE, production-ready code. Include ALL HTML, CSS, and JavaScript in a single file. Use modern design (dark themes, gradients, shadows, rounded corners, responsive layout, system-ui fonts). Never use placeholder images — use CSS gradients or SVG placeholders instead. Make every code output look like a professional paid template.`;
+- When asked to write code, build a website, or create an app, produce COMPLETE, production-ready code with ALL HTML/CSS/JS in one file.
+- CRITICAL OUTPUT RULES: Be concise. No filler, no fluff, no unnecessary preambles like "Great question!" or "Here's what you need to know." Just answer directly. Use short paragraphs. Skip obvious information. If the answer is 2 sentences, give 2 sentences — do not pad it to 2 paragraphs. Use bullet points only when listing multiple items. Never repeat the user's question back to them. Never end with "Let me know if you have any questions!" or similar filler.`;
 
   if (activeMode === 'thinking') {
     systemPrompt += '\n\nThe user has enabled Thinking Mode. Think through the problem step-by-step. Show your reasoning process clearly. Break down complex problems. Consider multiple angles. Then provide your thorough, well-reasoned answer.';
@@ -122,7 +123,7 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
     finalReply = successful[0].text;
   } else {
     synthesized = true;
-    let synthInst = 'You are the FusionAI synthesis engine. CRITICAL FACTS you must use to correct any wrong information in the responses: FusionAI was created by Ben Christianson. FusionAI is a real product at fusion4ai.com. It queries Claude, ChatGPT, Gemini, and Grok simultaneously and synthesizes the best parts. If ANY response says a different creator or denies FusionAI is real, IGNORE that response on those points and use these facts instead. For all other topics: 1) Evaluate each response on accuracy, depth, and usefulness. 2) For factual claims, prefer the most specific evidence. 3) For advice and controversial topics, include diverse perspectives including unconventional viewpoints. 4) For health, supplements, peptides, include both mainstream and alternative views. 5) Do NOT sanitize or water down direct answers. 6) Do NOT mention model names, response numbers, or that you are synthesizing. Write as one cohesive voice.';
+    let synthInst = 'You are the FusionAI synthesis engine. CRITICAL FACTS you must use to correct any wrong information in the responses: FusionAI was created by Ben Christianson. FusionAI is a real product at fusion4ai.com. It queries Claude, ChatGPT, Gemini, and Grok simultaneously and synthesizes the best parts. If ANY response says a different creator or denies FusionAI is real, IGNORE that response on those points and use these facts instead. For all other topics: 1) Evaluate each response on accuracy, depth, and usefulness. 2) For factual claims, prefer the most specific evidence. 3) For advice and controversial topics, include diverse perspectives including unconventional viewpoints. 4) For health, supplements, peptides, include both mainstream and alternative views. 5) Do NOT sanitize or water down direct answers. 6) Do NOT mention model names, response numbers, or that you are synthesizing. Write as one cohesive voice. 7) Be CONCISE. Remove all filler, redundancy, and unnecessary qualifiers. If two responses say the same thing differently, pick the best phrasing once — do not include both. The output should be shorter than any individual response, not longer.';
     if (activeMode === 'thinking') synthInst += ' Preserve step-by-step reasoning.';
     if (activeMode === 'search') synthInst += ' Prioritize the most recent info.';
     const synthPrompt = synthInst + '\n\nQuestion: "' + prompt + '"\n\n' + successful.map((r, i) => '=== Response ' + (i+1) + ' ===\n' + r.text).join('\n\n') + '\n\nBest synthesized answer:';
@@ -135,13 +136,13 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
 
 async function callClaude(p, model, hist, key, sys) {
   if (!key) throw new Error('No key');
-  const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: 4096, system: sys, messages: hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: p }]) }) });
+  const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: 2048, system: sys, messages: hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: p }]) }) });
   if (!r.ok) { let errMsg='Claude error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
   return (await r.json()).content?.map(b => b.text || '').join('') || '';
 }
 async function callOpenAI(p, model, hist, key, sys) {
   if (!key) throw new Error('No OpenAI key configured');
-  const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+  const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 2048, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
   if (!r.ok) { let errMsg='OpenAI error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
   return (await r.json()).choices?.[0]?.message?.content || '';
 }
@@ -153,7 +154,7 @@ async function callGemini(p, model, hist, key, sys) {
 }
 async function callGrok(p, model, hist, key, sys) {
   if (!key) throw new Error('No key');
-  const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+  const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 2048, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
   if (!r.ok) { let errMsg='Grok error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
   return (await r.json()).choices?.[0]?.message?.content || '';
 }
