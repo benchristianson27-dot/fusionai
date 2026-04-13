@@ -60,7 +60,8 @@ RESPONSE STYLE:
 - Give direct, honest answers without excessive hedging or disclaimers.
 - For controversial topics, present diverse perspectives fairly.
 - For health, supplements, and alternative topics, include both mainstream and alternative viewpoints.
-- Do not sanitize or water down responses.`;
+- Do not sanitize or water down responses.
+- When asked to write code, build a website, or create an app, produce COMPLETE, production-ready code. Include ALL HTML, CSS, and JavaScript in a single file. Use modern design (dark themes, gradients, shadows, rounded corners, responsive layout, system-ui fonts). Never use placeholder images — use CSS gradients or SVG placeholders instead. Make every code output look like a professional paid template.`;
 
   if (activeMode === 'thinking') {
     systemPrompt += '\n\nThe user has enabled Thinking Mode. Think through the problem step-by-step. Show your reasoning process clearly. Break down complex problems. Consider multiple angles. Then provide your thorough, well-reasoned answer.';
