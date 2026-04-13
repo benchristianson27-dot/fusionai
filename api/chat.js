@@ -1,3 +1,7 @@
+export const config = {
+  maxDuration: 60,
+};
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -57,19 +61,27 @@ CRITICAL RULES — follow these exactly:
   }
 
   const convHistory = Array.isArray(history) ? history.slice(-10) : [];
-  const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
+  
+function withTimeout(promise, ms, name) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(name + ' timed out after ' + ms + 'ms')), ms))
+  ]);
+}
+
+const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
 
   const results = await Promise.allSettled([
-    callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt),
-    callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt),
-    callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt),
-    callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt),
+    withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 20000, 'Claude'),
+    withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 20000, 'ChatGPT'),
+    withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 20000, 'Gemini'),
+    withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 20000, 'Grok'),
   ]);
 
   const successful = [], failed = [];
   results.forEach((r, i) => {
     if (r.status === 'fulfilled' && r.value) successful.push({ name: names[i], text: r.value });
-    else failed.push({ name: names[i], error: r.status === 'rejected' ? r.reason?.message : 'Empty' });
+    else failed.push({ name: names[i], error: r.status === 'rejected' ? (r.reason?.message || 'Unknown error') : 'Empty response' });
   });
 
   if (!successful.length) return res.status(500).json({ error: 'No models responded', details: failed });
@@ -87,30 +99,30 @@ CRITICAL RULES — follow these exactly:
     catch (e) { finalReply = successful[0].text; synthesized = false; }
   }
 
-  return res.status(200).json({ reply: finalReply, synthesized, models: successful.map(s => s.name), failed: failed.map(f => f.name), individual: successful, mode: activeMode });
+  return res.status(200).json({ reply: finalReply, synthesized, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, individual: successful, mode: activeMode });
 }
 
 async function callClaude(p, model, hist, key, sys) {
   if (!key) throw new Error('No key');
   const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: 4096, system: sys, messages: hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: p }]) }) });
-  if (!r.ok) { const e = await r.json(); throw new Error(e.error?.message || 'Claude error'); }
+  if (!r.ok) { let errMsg='Claude error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
   return (await r.json()).content?.map(b => b.text || '').join('') || '';
 }
 async function callOpenAI(p, model, hist, key, sys) {
-  if (!key) throw new Error('No key');
+  if (!key) throw new Error('No OpenAI key configured');
   const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
-  if (!r.ok) { const e = await r.json(); throw new Error(e.error?.message || 'OpenAI error'); }
+  if (!r.ok) { let errMsg='OpenAI error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
   return (await r.json()).choices?.[0]?.message?.content || '';
 }
 async function callGemini(p, model, hist, key, sys) {
-  if (!key) throw new Error('No key');
+  if (!key) throw new Error('No Gemini key configured');
   const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents: hist.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })).concat([{ role: 'user', parts: [{ text: p }] }]) }) });
-  if (!r.ok) { const e = await r.json(); throw new Error(e.error?.message || 'Gemini error'); }
+  if (!r.ok) { let errMsg='Gemini error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
   return (await r.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
 async function callGrok(p, model, hist, key, sys) {
   if (!key) throw new Error('No key');
   const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
-  if (!r.ok) { const e = await r.json(); throw new Error(e.error?.message || 'Grok error'); }
+  if (!r.ok) { let errMsg='Grok error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
   return (await r.json()).choices?.[0]?.message?.content || '';
 }
