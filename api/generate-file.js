@@ -1,6 +1,8 @@
 import PptxGenJS from 'pptxgenjs';
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType } from 'docx';
 
+import { verifyAuth } from './auth.js';
+
 export const config = {
   api: { bodyParser: { sizeLimit: '10mb' } },
   maxDuration: 60,
@@ -13,7 +15,11 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { prompt, fileType, tier } = req.body;
+  const user = await verifyAuth(req);
+  if (!user.authenticated) return res.status(401).json({ error: 'Sign in required' });
+  
+  const { prompt, fileType } = req.body;
+  const tier = user.tier;
   if (!prompt) return res.status(400).json({ error: 'No prompt' });
 
   const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
