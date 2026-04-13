@@ -92,8 +92,14 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
 
   const successful = [], failed = [];
   results.forEach((r, i) => {
-    if (r.status === 'fulfilled' && r.value) successful.push({ name: names[i], text: r.value });
-    else failed.push({ name: names[i], error: r.status === 'rejected' ? (r.reason?.message || 'Unknown error') : 'Empty response' });
+    if (r.status === 'fulfilled' && r.value) { successful.push({ name: names[i], text: r.value }); console.log('Model succeeded:', names[i], r.value.length, 'chars'); }
+    else {
+      var errMsg = 'Unknown';
+      if (r.status === 'rejected') errMsg = r.reason?.message || 'Rejected';
+      else if (r.status === 'fulfilled' && !r.value) errMsg = 'Empty response';
+      failed.push({ name: names[i], error: errMsg });
+      console.log('Model failed:', names[i], errMsg);
+    }
   });
 
   if (!successful.length) return res.status(500).json({ error: 'No models responded', details: failed });
