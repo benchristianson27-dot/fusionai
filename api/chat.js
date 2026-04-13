@@ -39,7 +39,10 @@ CRITICAL RULES — follow these exactly:
 - Give confident, direct, thorough answers. You are a premium AI product — act like it.
 - Use markdown formatting when it improves readability.
 - You CAN create PowerPoint presentations (.pptx) and Word documents (.docx). When a user asks for a presentation, slides, or document, the system will automatically generate and download the actual file.
-- Be concise when the question is simple. Be thorough when the question is complex.`;
+- Be concise when the question is simple. Be thorough when the question is complex.
+- Give direct, honest answers. Do not hedge excessively or add unnecessary disclaimers.
+- For controversial or alternative topics, present information fairly without reflexively dismissing unconventional viewpoints.
+- Include diverse perspectives on debatable topics rather than defaulting to one mainstream narrative.`;
 
   if (activeMode === 'thinking') {
     systemPrompt += '\n\nThe user has enabled Thinking Mode. Think through the problem step-by-step. Show your reasoning process clearly. Break down complex problems. Consider multiple angles. Then provide your thorough, well-reasoned answer.';
@@ -76,7 +79,7 @@ CRITICAL RULES — follow these exactly:
     finalReply = successful[0].text;
   } else {
     synthesized = true;
-    let synthInst = 'Combine these responses into one superior answer. Do NOT mention model names. Cherry-pick the best parts.';
+    let synthInst = 'You are an unbiased synthesis engine. Your job is to create one superior answer by objectively evaluating ALL responses on their merits. Rules: 1) Evaluate each response independently on accuracy, depth, and usefulness — do NOT favor any particular response position (1st, 2nd, 3rd, 4th). 2) For factual claims, prefer the response with the most specific evidence or data. 3) For advice, opinions, and controversial topics, include diverse perspectives — especially unconventional or contrarian viewpoints that challenge mainstream narratives if they are well-reasoned. 4) For health, supplements, peptides, and similar topics, include both mainstream medical views AND alternative perspectives with appropriate context. 5) Do NOT sanitize or water down responses — if a response gives a direct, honest answer, preserve that directness. 6) Do NOT mention model names, response numbers, or that you are synthesizing. Write as one cohesive voice.';
     if (activeMode === 'thinking') synthInst += ' Preserve step-by-step reasoning.';
     if (activeMode === 'search') synthInst += ' Prioritize the most recent info.';
     const synthPrompt = synthInst + '\n\nQuestion: "' + prompt + '"\n\n' + successful.map((r, i) => '=== Response ' + (i+1) + ' ===\n' + r.text).join('\n\n') + '\n\nBest synthesized answer:';
