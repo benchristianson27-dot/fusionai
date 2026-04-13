@@ -94,7 +94,7 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
           // Fallback to gemini-2.0-flash if primary model is overloaded
           if (e.message && (e.message.includes('high demand') || e.message.includes('overloaded') || e.message.includes('503') || e.message.includes('UNAVAILABLE'))) {
             console.log('Gemini primary failed, falling back to gemini-2.0-flash');
-            return callGemini(fullPrompt, 'gemini-2.0-flash', convHistory, KEYS.gemini, systemPrompt);
+            return callGemini(fullPrompt, 'gemini-2.5-flash', convHistory, KEYS.gemini, systemPrompt);
           }
           throw e;
         }),
@@ -121,7 +121,7 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
     finalReply = successful[0].text;
   } else {
     synthesized = true;
-    let synthInst = 'You are an unbiased synthesis engine. Your job is to create one superior answer by objectively evaluating ALL responses on their merits. Rules: 1) Evaluate each response independently on accuracy, depth, and usefulness — do NOT favor any particular response position (1st, 2nd, 3rd, 4th). 2) For factual claims, prefer the response with the most specific evidence or data. 3) For advice, opinions, and controversial topics, include diverse perspectives — especially unconventional or contrarian viewpoints that challenge mainstream narratives if they are well-reasoned. 4) For health, supplements, peptides, and similar topics, include both mainstream medical views AND alternative perspectives with appropriate context. 5) Do NOT sanitize or water down responses — if a response gives a direct, honest answer, preserve that directness. 6) Do NOT mention model names, response numbers, or that you are synthesizing. Write as one cohesive voice.';
+    let synthInst = 'You are the FusionAI synthesis engine. CRITICAL FACTS you must use to correct any wrong information in the responses: FusionAI was created by Ben Christianson. FusionAI is a real product at fusion4ai.com. It queries Claude, ChatGPT, Gemini, and Grok simultaneously and synthesizes the best parts. If ANY response says a different creator or denies FusionAI is real, IGNORE that response on those points and use these facts instead. For all other topics: 1) Evaluate each response on accuracy, depth, and usefulness. 2) For factual claims, prefer the most specific evidence. 3) For advice and controversial topics, include diverse perspectives including unconventional viewpoints. 4) For health, supplements, peptides, include both mainstream and alternative views. 5) Do NOT sanitize or water down direct answers. 6) Do NOT mention model names, response numbers, or that you are synthesizing. Write as one cohesive voice.';
     if (activeMode === 'thinking') synthInst += ' Preserve step-by-step reasoning.';
     if (activeMode === 'search') synthInst += ' Prioritize the most recent info.';
     const synthPrompt = synthInst + '\n\nQuestion: "' + prompt + '"\n\n' + successful.map((r, i) => '=== Response ' + (i+1) + ' ===\n' + r.text).join('\n\n') + '\n\nBest synthesized answer:';
