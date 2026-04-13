@@ -16,11 +16,11 @@ export default async function handler(req, res) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
       body: JSON.stringify({
-        model: 'dall-e-3',
+        model: 'gpt-image-1',
         prompt: prompt,
         n: 1,
         size: '1024x1024',
-        quality: 'standard',
+        quality: 'medium',
       }),
     });
 
@@ -30,9 +30,14 @@ export default async function handler(req, res) {
     }
 
     const data = await r.json();
+    var imgData = data.data[0];
+    var url = imgData.url || null;
+    if (!url && imgData.b64_json) {
+      url = 'data:image/png;base64,' + imgData.b64_json;
+    }
     return res.status(200).json({
-      url: data.data[0].url,
-      revised_prompt: data.data[0].revised_prompt,
+      url: url,
+      revised_prompt: imgData.revised_prompt || prompt,
     });
   } catch (e) {
     console.error('Image gen error:', e);
