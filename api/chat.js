@@ -16,6 +16,7 @@ export default async function handler(req, res) {
   // Use client-supplied tier
   const tier = clientTier || 'free';
   if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
+  console.log('Request:', { tier, mainMode, promptLen: prompt.length, hasKeys: { claude: !!KEYS.anthropic, openai: !!KEYS.openai, gemini: !!KEYS.gemini, grok: !!KEYS.grok } });
 
   const KEYS = {
     anthropic: process.env.ANTHROPIC_API_KEY,
@@ -25,10 +26,10 @@ export default async function handler(req, res) {
   };
 
   const TIER_MODELS = {
-    free: { claude: 'claude-haiku-4-5-20251001', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash-lite', grok: 'grok-3-mini-latest' },
-    starter: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash', grok: 'grok-3-mini-latest' },
-    pro: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.5-pro', grok: 'grok-3-latest' },
-    enterprise: { claude: 'claude-opus-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.5-pro', grok: 'grok-3-latest' },
+    free: { claude: 'claude-haiku-4-5-20251001', openai: 'gpt-4o-mini', gemini: 'gemini-2.0-flash', grok: 'grok-3-mini' },
+    starter: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o-mini', gemini: 'gemini-2.0-flash', grok: 'grok-3-mini' },
+    pro: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.0-flash', grok: 'grok-3' },
+    enterprise: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.0-flash', grok: 'grok-3' },
   };
 
   const models = TIER_MODELS[tier] || TIER_MODELS.free;
@@ -106,20 +107,20 @@ function withTimeout(promise, ms, name) {
 const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
 
   const results = await Promise.allSettled([
-    withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 40000, 'Claude'),
-    withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 40000, 'ChatGPT'),
+    withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 50000, 'Claude'),
+    withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 50000, 'ChatGPT'),
     withTimeout(
       callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt)
         .catch(function(e) {
           // Fallback to gemini-2.0-flash if primary model is overloaded
           if (e.message && (e.message.includes('high demand') || e.message.includes('overloaded') || e.message.includes('503') || e.message.includes('UNAVAILABLE'))) {
             console.log('Gemini primary failed, falling back to gemini-2.0-flash');
-            return callGemini(fullPrompt, 'gemini-2.5-flash', convHistory, KEYS.gemini, systemPrompt);
+            return callGemini(fullPrompt, 'gemini-2.0-flash-lite', convHistory, KEYS.gemini, systemPrompt);
           }
           throw e;
         }),
-      40000, 'Gemini'),
-    withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 40000, 'Grok'),
+      50000, 'Gemini'),
+    withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 50000, 'Grok'),
   ]);
 
   const successful = [], failed = [];
@@ -160,10 +161,10 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
     const debatePrompt = 'You are ' + 'one of several AI models in a debate. The user asked: "' + prompt + '"\n\nHere is what each model responded:\n\n' + debateContext + '\n\nNow write your REBUTTAL. Directly address points you disagree with from the other models. Be specific — quote or reference what they said and explain why you think differently. If you agree with something, say so briefly, but focus on where you DISAGREE or have a DIFFERENT perspective. Be direct and confident in your position. Keep it concise (2-4 paragraphs). Do not repeat your original answer.';
     
     const round2Results = await Promise.allSettled([
-      successful.find(s => s.name === 'Claude') ? withTimeout(callClaude(debatePrompt, models.claude, [], KEYS.anthropic, 'You are Claude in a multi-AI debate. Be direct and defend your position.'), 40000, 'Claude') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'ChatGPT') ? withTimeout(callOpenAI(debatePrompt, models.openai, [], KEYS.openai, 'You are ChatGPT in a multi-AI debate. Be direct and defend your position.'), 40000, 'ChatGPT') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'Gemini') ? withTimeout(callGemini(debatePrompt, models.gemini, [], KEYS.gemini, 'You are Gemini in a multi-AI debate. Be direct and defend your position.'), 40000, 'Gemini') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'Grok') ? withTimeout(callGrok(debatePrompt, models.grok, [], KEYS.grok, 'You are Grok in a multi-AI debate. Be direct, bold, and unapologetic in your position.'), 40000, 'Grok') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'Claude') ? withTimeout(callClaude(debatePrompt, models.claude, [], KEYS.anthropic, 'You are Claude in a multi-AI debate. Be direct and defend your position.'), 50000, 'Claude') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'ChatGPT') ? withTimeout(callOpenAI(debatePrompt, models.openai, [], KEYS.openai, 'You are ChatGPT in a multi-AI debate. Be direct and defend your position.'), 50000, 'ChatGPT') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'Gemini') ? withTimeout(callGemini(debatePrompt, models.gemini, [], KEYS.gemini, 'You are Gemini in a multi-AI debate. Be direct and defend your position.'), 50000, 'Gemini') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'Grok') ? withTimeout(callGrok(debatePrompt, models.grok, [], KEYS.grok, 'You are Grok in a multi-AI debate. Be direct, bold, and unapologetic in your position.'), 50000, 'Grok') : Promise.reject('skipped'),
     ]);
     
     const round2 = [];
