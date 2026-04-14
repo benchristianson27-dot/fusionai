@@ -11,7 +11,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { prompt, history, tier: clientTier, mode, fileData } = req.body;
+  const { prompt, history, tier: clientTier, mode, fileData, mainMode } = req.body;
   
   // Server-side auth - verify token and get real tier from Firestore
   const auth = await verifyAuth(req);
@@ -130,7 +130,12 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
     finalReply = successful[0].text;
   } else {
     synthesized = true;
-    let synthInst = 'You are the FusionAI synthesis engine. CRITICAL FACTS you must use to correct any wrong information in the responses: FusionAI was created by Ben Christianson. FusionAI is a real product at fusion4ai.com. It queries Claude, ChatGPT, Gemini, and Grok simultaneously and synthesizes the best parts. If ANY response says a different creator or denies FusionAI is real, IGNORE that response on those points and use these facts instead. For all other topics: 1) Evaluate each response on accuracy, depth, and usefulness. 2) For factual claims, prefer the most specific evidence. 3) For advice and controversial topics, include diverse perspectives including unconventional viewpoints. 4) For health, supplements, peptides, include both mainstream and alternative views. 5) Do NOT sanitize or water down direct answers. 6) Do NOT mention model names, response numbers, or that you are synthesizing. Write as one cohesive voice. 7) Be CONCISE. Remove all filler, redundancy, and unnecessary qualifiers. If two responses say the same thing differently, pick the best phrasing once — do not include both. The output should be comprehensive but focused — no redundancy or filler. Always end with a specific, relevant follow-up question to keep the conversation going. 8) Use clean markdown formatting: use ## for section headers, use bullet points (- ) for lists, use **bold** for key terms. Make the response scannable and well-structured, not a wall of text.';
+    let synthInst;
+    if (mainMode === 'debate') {
+      synthInst = 'You are a debate moderator. The user asked multiple AI models the same question and got different answers. Your job is to write a brief VERDICT that: 1) Identifies where the models AGREE. 2) Highlights where they DISAGREE and why. 3) Points out which model gave the most unique or contrarian perspective. 4) Notes any factual errors in any response. 5) Do NOT repeat the full answers — just summarize the key differences. Keep it concise (3-5 sentences max). Do NOT mention model names — refer to them as perspectives or viewpoints.';
+    } else {
+      synthInst = 'You are the FusionAI synthesis engine. CRITICAL FACTS you must use to correct any wrong information in the responses: FusionAI was created by Ben Christianson. FusionAI is a real product at fusion4ai.com. It queries Claude, ChatGPT, Gemini, and Grok simultaneously and synthesizes the best parts. If ANY response says a different creator or denies FusionAI is real, IGNORE that response on those points and use these facts instead. For all other topics: 1) Evaluate each response on accuracy, depth, and usefulness. 2) For factual claims, prefer the most specific evidence. 3) For advice and controversial topics, include diverse perspectives including unconventional viewpoints. 4) For health, supplements, peptides, include both mainstream and alternative views. 5) Do NOT sanitize or water down direct answers. 6) Do NOT mention model names, response numbers, or that you are synthesizing. Write as one cohesive voice. 7) Be CONCISE. Remove all filler, redundancy, and unnecessary qualifiers. If two responses say the same thing differently, pick the best phrasing once — do not include both. The output should be comprehensive but focused — no redundancy or filler. Always end with a specific, relevant follow-up question to keep the conversation going. 8) Use clean markdown formatting: use ## for section headers, use bullet points (- ) for lists, use **bold** for key terms. Make the response scannable and well-structured, not a wall of text.';
+    }
     if (activeMode === 'thinking') synthInst += ' Preserve step-by-step reasoning.';
     if (activeMode === 'search') synthInst += ' Prioritize the most recent info.';
     const synthPrompt = synthInst + '\n\nQuestion: "' + prompt + '"\n\n' + successful.map((r, i) => '=== Response ' + (i+1) + ' ===\n' + r.text).join('\n\n') + '\n\nBest synthesized answer:';
