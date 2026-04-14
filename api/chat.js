@@ -82,12 +82,36 @@ RESPONSE STYLE:
     systemPrompt += '\n\nThe user has enabled Web Search Mode. Provide the most current, up-to-date information possible. Include specific dates, sources, and facts. If unsure about recency, acknowledge your knowledge cutoff date.';
   }
 
+  let imageNote = '';
+  if (imageContent.length > 0) {
+    imageNote = '\n[The user attached ' + imageContent.length + ' image(s). You cannot view images directly. Ask the user to describe the image or paste any text from it.]';
+  }
   let fullPrompt = prompt;
   if (fileData && fileData.length > 0) {
     fullPrompt = fileData.map(f => '[File: ' + f.name + ']\n' + f.content).join('\n\n') + '\n\n' + prompt;
   }
 
   const convHistory = Array.isArray(history) ? history.slice(-10) : [];
+  
+  // Handle image attachments - build vision-compatible messages
+  let imageContent = [];
+  if (Array.isArray(fileData)) {
+    fileData.forEach(f => {
+      if (f.type === 'image' && f.dataUrl) {
+        imageContent.push({ type: 'image_url', image_url: { url: f.dataUrl } });
+      }
+    });
+  }
+  
+  // Handle image attachments - build vision-compatible messages
+  
+  if (Array.isArray(fileData)) {
+    fileData.forEach(f => {
+      if (f.type === 'image' && f.dataUrl) {
+        imageContent.push({ type: 'image_url', image_url: { url: f.dataUrl } });
+      }
+    });
+  }
   
   // Special context for the creator
   const authHeader = req.headers.authorization;
@@ -117,7 +141,7 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
 
   const results = await Promise.allSettled([
     withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 50000, 'Claude'),
-    withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 50000, 'ChatGPT'),
+    withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt, imageContent), 50000, 'ChatGPT'),
     withTimeout(
       callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt)
         .catch(function(e) {
