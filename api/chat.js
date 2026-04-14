@@ -68,10 +68,11 @@ RESPONSE STYLE:
 - For health, supplements, and alternative topics, include both mainstream and alternative viewpoints.
 - Do not sanitize or water down responses.
 - When asked to write code, build a website, or create an app, produce COMPLETE, production-ready code with ALL HTML/CSS/JS in one file.
-- OUTPUT FORMAT: For complex or detailed requests (marketing plans, strategies, analysis, comparisons), start with a brief 1-2 sentence preview explaining what you're about to cover. Then deliver the full response. Write in flowing paragraphs. Use bullet points ONLY for actual lists. Keep paragraphs short (2-3 sentences). Use **bold** for key terms. Use ## headers to separate major sections in longer responses. For simple questions, just answer directly with no headers.
-- DATA VISUALIZATION: When discussing numbers, budgets, percentages, or comparisons, include a markdown table to make the data scannable. For example, budget breakdowns should be in a table with columns for Channel, Budget, Percentage, Expected ROI. KPIs should be in a table. Comparison data should be in a table. This makes the response feel premium and professional.
+- OUTPUT FORMAT: For complex requests (plans, strategies, analysis), give a THOROUGH, DETAILED response. Do not summarize — go deep. Include specific numbers, timelines, examples, and actionable steps. A marketing plan should be 800+ words with multiple detailed sections. A strategy should include implementation steps, timelines, KPIs, and examples. Start with a 1-2 sentence preview, then deliver the full detailed response. Write in flowing paragraphs with ## headers for major sections. Use **bold** for key terms.
+- DATA VISUALIZATION: Include markdown tables for ALL numerical data — budgets, timelines, metrics, comparisons. Use multiple tables when covering different data (one for budget, one for KPIs, one for timeline, etc). Tables should have 4+ rows of real data.
+- DEPTH: When discussing strategies, include the WHY behind each recommendation, not just the what. Give specific examples, cite realistic numbers, and explain tradeoffs. If recommending a budget split, explain why each channel gets that percentage.
 - No filler. No "Great question!" Just answer directly.
-- End with one specific follow-up question.`;
+- End with 2-3 specific follow-up questions to explore different aspects deeper.`;
 
   if (activeMode === 'thinking') {
     systemPrompt += '\n\nThe user has enabled Thinking Mode. Think through the problem step-by-step. Show your reasoning process clearly. Break down complex problems. Consider multiple angles. Then provide your thorough, well-reasoned answer.';
@@ -212,7 +213,17 @@ async function callGemini(p, model, hist, key, sys) {
 }
 async function callGrok(p, model, hist, key, sys) {
   if (!key) throw new Error('No key');
-  const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
-  if (!r.ok) { let errMsg='Grok error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
-  return (await r.json()).choices?.[0]?.message?.content || '';
+  // Try primary call
+  try {
+    const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+    if (r.ok) return (await r.json()).choices?.[0]?.message?.content || '';
+    if (r.status === 500 || r.status === 502 || r.status === 503) {
+      // Retry once on server error
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      const r2 = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+      if (!r2.ok) { let errMsg='Grok error '+r2.status; try{const e=await r2.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
+      return (await r2.json()).choices?.[0]?.message?.content || '';
+    }
+    let errMsg='Grok error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg);
+  } catch(e) { throw e; }
 }
