@@ -1,7 +1,7 @@
 import { verifyAuth } from './auth.js';
 
 export const config = {
-  maxDuration: 120,
+  maxDuration: 90,
 };
 
 export default async function handler(req, res) {
@@ -107,8 +107,8 @@ function withTimeout(promise, ms, name) {
 const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
 
   const results = await Promise.allSettled([
-    withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 50000, 'Claude'),
-    withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 50000, 'ChatGPT'),
+    withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 40000, 'Claude'),
+    withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 40000, 'ChatGPT'),
     withTimeout(
       callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt)
         .catch(function(e) {
@@ -119,8 +119,8 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
           }
           throw e;
         }),
-      50000, 'Gemini'),
-    withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 50000, 'Grok'),
+      40000, 'Gemini'),
+    withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 40000, 'Grok'),
   ]);
 
   const successful = [], failed = [];
@@ -166,7 +166,7 @@ SYNTHESIS METHOD:
     if (activeMode === 'thinking') synthInst += ' Preserve step-by-step reasoning.';
     if (activeMode === 'search') synthInst += ' Prioritize the most recent info.';
     const synthPrompt = synthInst + '\n\nQuestion: "' + prompt + '"\n\n' + successful.map((r, i) => '=== Response ' + (i+1) + ' ===\n' + r.text).join('\n\n') + '\n\nBest synthesized answer:';
-    try { finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 50000, 'Synthesis'); }
+    try { finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 30000, 'Synthesis'); }
     catch (e) { finalReply = successful[0].text; synthesized = false; }
   }
 
@@ -176,10 +176,10 @@ SYNTHESIS METHOD:
     const debatePrompt = 'You are ' + 'one of several AI models in a debate. The user asked: "' + prompt + '"\n\nHere is what each model responded:\n\n' + debateContext + '\n\nNow write your REBUTTAL. Directly address points you disagree with from the other models. Be specific — quote or reference what they said and explain why you think differently. If you agree with something, say so briefly, but focus on where you DISAGREE or have a DIFFERENT perspective. Be direct and confident in your position. Keep it concise (2-4 paragraphs). Do not repeat your original answer.';
     
     const round2Results = await Promise.allSettled([
-      successful.find(s => s.name === 'Claude') ? withTimeout(callClaude(debatePrompt, models.claude, [], KEYS.anthropic, 'You are Claude in a multi-AI debate. Be direct and defend your position.'), 50000, 'Claude') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'ChatGPT') ? withTimeout(callOpenAI(debatePrompt, models.openai, [], KEYS.openai, 'You are ChatGPT in a multi-AI debate. Be direct and defend your position.'), 50000, 'ChatGPT') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'Gemini') ? withTimeout(callGemini(debatePrompt, models.gemini, [], KEYS.gemini, 'You are Gemini in a multi-AI debate. Be direct and defend your position.'), 50000, 'Gemini') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'Grok') ? withTimeout(callGrok(debatePrompt, models.grok, [], KEYS.grok, 'You are Grok in a multi-AI debate. Be direct, bold, and unapologetic in your position.'), 50000, 'Grok') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'Claude') ? withTimeout(callClaude(debatePrompt, models.claude, [], KEYS.anthropic, 'You are Claude in a multi-AI debate. Be direct and defend your position.'), 40000, 'Claude') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'ChatGPT') ? withTimeout(callOpenAI(debatePrompt, models.openai, [], KEYS.openai, 'You are ChatGPT in a multi-AI debate. Be direct and defend your position.'), 40000, 'ChatGPT') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'Gemini') ? withTimeout(callGemini(debatePrompt, models.gemini, [], KEYS.gemini, 'You are Gemini in a multi-AI debate. Be direct and defend your position.'), 40000, 'Gemini') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'Grok') ? withTimeout(callGrok(debatePrompt, models.grok, [], KEYS.grok, 'You are Grok in a multi-AI debate. Be direct, bold, and unapologetic in your position.'), 40000, 'Grok') : Promise.reject('skipped'),
     ]);
     
     const round2 = [];
