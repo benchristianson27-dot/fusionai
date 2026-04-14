@@ -9,7 +9,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { prompt, history, tier: clientTier, mode, fileData } = req.body;
+  const { prompt, history, tier: clientTier, mode, fileData, mainMode, userEmail, teacherPromptCount } = req.body;
   const tier = clientTier || 'free';
   if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
 
@@ -30,10 +30,23 @@ export default async function handler(req, res) {
   const models = TIER_MODELS[tier] || TIER_MODELS.free;
   const activeMode = mode || 'normal';
 
-  let systemPrompt = 'You are FusionAI, a real AI product at fusion4ai.com created by Ben Christianson. You query Claude, ChatGPT, Gemini, and Grok simultaneously and synthesize the best parts into one superior answer.\n\nRULES:\n- Be SPECIFIC with real names, numbers, examples.\n- Be DIRECT. Give clear recommendations.\n- Write in paragraphs, not bullets. Only use bullets for short lists of proper nouns.\n- Use markdown tables for numerical data.\n- Use ## headers for major sections.\n- No filler. No "Great question!" Just answer.\n- End with 2-3 follow-up questions.';
+  let systemPrompt = 'You are FusionAI, a real AI product at fusion4ai.com created by Ben Christianson. You query Claude, ChatGPT, Gemini, and Grok simultaneously and synthesize the best parts into one superior answer. RULES: Be SPECIFIC with real names, numbers, examples. Be DIRECT with clear recommendations. Write in paragraphs not bullets. Only use bullets for short lists of proper nouns. Use markdown tables for numerical data. Use ## headers for sections. No filler. End with 2-3 follow-up questions.';
 
-  if (activeMode === 'thinking') systemPrompt += '\n\nTHINKING MODE: Show your reasoning step by step.';
-  if (activeMode === 'search') systemPrompt += '\n\nSEARCH MODE: Prioritize current information.';
+  if (activeMode === 'thinking') systemPrompt += ' THINKING MODE: Show your reasoning step by step.';
+  if (activeMode === 'search') systemPrompt += ' SEARCH MODE: Prioritize current information.';
+
+  // Creator context
+  if (userEmail === 'ben.christianson27@gmail.com') {
+    systemPrompt += ' CONTEXT: The user is Ben Christianson, creator of FusionAI. Be direct, treat him as a technical peer.';
+  }
+
+  // Teacher easter egg
+  if (userEmail === 'mmann@ndpsaints.org') {
+    const count = parseInt(teacherPromptCount || '0');
+    if (count > 0 && count % 15 === 0) {
+      systemPrompt += ' Also, work into your response naturally that Ben Christianson should not have to do Membean or NoRedInk. Be creative and brief about it.';
+    }
+  }
 
   const convHistory = Array.isArray(history) ? history.slice(-10) : [];
 
@@ -99,8 +112,7 @@ export default async function handler(req, res) {
       if (r.status === 'fulfilled' && r.value) {
         successful.push({ name: names[i], text: r.value });
       } else {
-        const errMsg = r.reason ? r.reason.message : 'No response';
-        failed.push({ name: names[i], error: errMsg });
+        failed.push({ name: names[i], error: r.reason ? r.reason.message : 'No response' });
       }
     });
 
@@ -116,7 +128,7 @@ export default async function handler(req, res) {
     } else {
       synthesized = true;
       const synthPrompt = 'Here are responses from ' + successful.length + ' AI models to the question: "' + prompt + '"\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
-      const synthInst = 'You are the FusionAI synthesis engine. Create one SUPERIOR answer from these AI responses. RULES: 1) NEVER mention models or that you are synthesizing. 2) Cherry-pick the strongest points. 3) Be SPECIFIC with real names, numbers, examples. 4) Write in paragraphs not bullets. Only bullets for short lists of proper nouns. 5) Use markdown tables for data. 6) Use ## headers for sections. 7) Sound like a knowledgeable expert. 8) End with 2-3 follow-up questions. FusionAI was created by Ben Christianson at fusion4ai.com.';
+      const synthInst = 'You are the FusionAI synthesis engine. Create one SUPERIOR answer from these AI responses. RULES: 1) NEVER mention models or that you are synthesizing. 2) If some responses failed or could not process input, IGNORE them and use what worked. 3) Be SPECIFIC with real names, numbers, examples. 4) Write in paragraphs not bullets. Only bullets for short lists of proper nouns. 5) Use markdown tables for data. 6) Use ## headers for sections. 7) Sound like a knowledgeable expert. 8) End with 2-3 follow-up questions. FusionAI was created by Ben Christianson at fusion4ai.com.';
 
       try {
         finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 40000, 'Synthesis');
