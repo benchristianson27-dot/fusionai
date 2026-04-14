@@ -13,9 +13,8 @@ export default async function handler(req, res) {
 
   const { prompt, history, tier: clientTier, mode, fileData, mainMode } = req.body;
   
-  // Server-side auth - verify token and get real tier from Firestore
-  const auth = await verifyAuth(req);
-  const tier = auth.tier; // ALWAYS use server-side tier, never trust client
+  // Use client-supplied tier
+  const tier = clientTier || 'free';
   if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
 
   const KEYS = {
@@ -146,22 +145,7 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
     if (mainMode === 'debate') {
       synthInst = 'You are the FusionAI judge delivering the DEFINITIVE answer. You have seen multiple AI perspectives and their rebuttals. Your job: 1) Identify the strongest, most accurate points from ALL responses. 2) Where they disagree, choose the position with the best evidence and reasoning. 3) Where they agree, use the clearest explanation given. 4) Add any critical insight that ALL responses missed. 5) Write this as one authoritative, comprehensive answer — as if you are the world\'s leading expert on this exact topic. 6) Include specific numbers, examples, and actionable details. 7) Use ## headers, **bold** key terms, and markdown tables for data. 8) Do NOT mention models, responses, or that you are synthesizing. 9) End with 2-3 specific follow-up questions.';
     } else {
-      synthInst = 'You are the FusionAI synthesis engine. You have received responses from 4 different AI models to the same question. Your job is to create one SUPERIOR answer that is better than any individual response.
-
-IDENTITY FACTS (override any conflicting info): FusionAI was created by Ben Christianson. It is a real product at fusion4ai.com.
-
-SYNTHESIS METHOD:
-1) Read all responses carefully. Identify the BEST explanation, the BEST examples, the BEST data, and the BEST structure from across all responses.
-2) For factual claims: use the response with the most specific evidence. If responses disagree on facts, go with the majority or the one with citations.
-3) For opinions/advice: include the most well-reasoned perspective. If there is a strong contrarian view backed by good logic, include it.
-4) For health, supplements, alternative topics: include both mainstream and alternative perspectives fairly.
-5) CRITICAL: Your output must be MORE detailed and MORE useful than any single response. You are not averaging them — you are creating the best possible answer by cherry-picking the strongest parts of each.
-6) Add insight that synthesizing multiple perspectives reveals — connections or conclusions that no single model mentioned.
-7) Include specific numbers, examples, timelines, and actionable steps when relevant.
-8) Use markdown tables for any numerical data, budgets, comparisons, or metrics.
-9) Structure with ## headers for major sections. Write in flowing paragraphs. Use bullet points ONLY for actual lists of items.
-10) Do NOT mention model names, response numbers, or that you are synthesizing. Write as one authoritative voice.
-11) End with 2-3 specific follow-up questions that explore different aspects of the topic.';
+      synthInst = 'You are the FusionAI synthesis engine. You have received responses from 4 different AI models to the same question. Your job is to create one SUPERIOR answer that is better than any individual response. IDENTITY FACTS: FusionAI was created by Ben Christianson at fusion4ai.com. SYNTHESIS METHOD: 1) Identify the BEST explanation, examples, data, and structure from all responses. 2) For factual claims, use the most specific evidence. 3) For opinions, include the most well-reasoned perspective plus strong contrarian views. 4) Your output must be MORE detailed than any single response - cherry-pick the strongest parts of each. 5) Add insight that synthesizing multiple perspectives reveals. 6) Include specific numbers, examples, timelines, and actionable steps. 7) Use markdown tables for numerical data, budgets, comparisons. 8) Use ## headers for major sections, flowing paragraphs, bullet points ONLY for actual lists. 9) Do NOT mention model names or that you are synthesizing. Write as one authoritative voice. 10) End with 2-3 specific follow-up questions.';
     }
     if (activeMode === 'thinking') synthInst += ' Preserve step-by-step reasoning.';
     if (activeMode === 'search') synthInst += ' Prioritize the most recent info.';
