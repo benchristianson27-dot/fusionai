@@ -118,7 +118,7 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
           }
           throw e;
         }),
-      30000, 'Gemini'),
+      50000, 'Gemini'),
     withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 50000, 'Grok'),
   ]);
 
@@ -160,10 +160,10 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
     const debatePrompt = 'You are ' + 'one of several AI models in a debate. The user asked: "' + prompt + '"\n\nHere is what each model responded:\n\n' + debateContext + '\n\nNow write your REBUTTAL. Directly address points you disagree with from the other models. Be specific — quote or reference what they said and explain why you think differently. If you agree with something, say so briefly, but focus on where you DISAGREE or have a DIFFERENT perspective. Be direct and confident in your position. Keep it concise (2-4 paragraphs). Do not repeat your original answer.';
     
     const round2Results = await Promise.allSettled([
-      successful.find(s => s.name === 'Claude') ? withTimeout(callClaude(debatePrompt, models.claude, [], KEYS.anthropic, 'You are Claude in a multi-AI debate. Be direct and defend your position.'), 30000, 'Claude') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'ChatGPT') ? withTimeout(callOpenAI(debatePrompt, models.openai, [], KEYS.openai, 'You are ChatGPT in a multi-AI debate. Be direct and defend your position.'), 30000, 'ChatGPT') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'Gemini') ? withTimeout(callGemini(debatePrompt, models.gemini, [], KEYS.gemini, 'You are Gemini in a multi-AI debate. Be direct and defend your position.'), 30000, 'Gemini') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'Grok') ? withTimeout(callGrok(debatePrompt, models.grok, [], KEYS.grok, 'You are Grok in a multi-AI debate. Be direct, bold, and unapologetic in your position.'), 30000, 'Grok') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'Claude') ? withTimeout(callClaude(debatePrompt, models.claude, [], KEYS.anthropic, 'You are Claude in a multi-AI debate. Be direct and defend your position.'), 50000, 'Claude') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'ChatGPT') ? withTimeout(callOpenAI(debatePrompt, models.openai, [], KEYS.openai, 'You are ChatGPT in a multi-AI debate. Be direct and defend your position.'), 50000, 'ChatGPT') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'Gemini') ? withTimeout(callGemini(debatePrompt, models.gemini, [], KEYS.gemini, 'You are Gemini in a multi-AI debate. Be direct and defend your position.'), 50000, 'Gemini') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'Grok') ? withTimeout(callGrok(debatePrompt, models.grok, [], KEYS.grok, 'You are Grok in a multi-AI debate. Be direct, bold, and unapologetic in your position.'), 50000, 'Grok') : Promise.reject('skipped'),
     ]);
     
     const round2 = [];
@@ -191,7 +191,7 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
 
 async function callClaude(p, model, hist, key, sys) {
   if (!key) throw new Error('No key');
-  const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: 2048, system: sys, messages: hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: p }]) }) });
+  const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: 4096, system: sys, messages: hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: p }]) }) });
   if (!r.ok) { let errMsg='Claude error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
   var cData = await r.json();
   var cText = (cData.content || []).map(b => b.text || '').join('');
@@ -200,7 +200,7 @@ async function callClaude(p, model, hist, key, sys) {
 }
 async function callOpenAI(p, model, hist, key, sys) {
   if (!key) throw new Error('No OpenAI key configured');
-  const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 2048, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+  const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
   if (!r.ok) { let errMsg='OpenAI error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
   return (await r.json()).choices?.[0]?.message?.content || '';
 }
@@ -212,7 +212,7 @@ async function callGemini(p, model, hist, key, sys) {
 }
 async function callGrok(p, model, hist, key, sys) {
   if (!key) throw new Error('No key');
-  const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 2048, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+  const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
   if (!r.ok) { let errMsg='Grok error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
   return (await r.json()).choices?.[0]?.message?.content || '';
 }
