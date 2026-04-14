@@ -25,10 +25,10 @@ export default async function handler(req, res) {
   };
 
   const TIER_MODELS = {
-    free: { claude: 'claude-haiku-4-5-20251001', openai: 'gpt-4o-mini', gemini: 'gemini-2.0-flash', grok: 'grok-3-mini' },
-    starter: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o-mini', gemini: 'gemini-2.0-flash', grok: 'grok-3-mini' },
-    pro: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.0-flash', grok: 'grok-3' },
-    enterprise: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.0-flash', grok: 'grok-3' },
+    free: { claude: 'claude-haiku-4-5-20251001', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash', grok: 'grok-3-mini' },
+    starter: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash', grok: 'grok-3-mini' },
+    pro: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.5-flash', grok: 'grok-3' },
+    enterprise: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.5-flash', grok: 'grok-3' },
   };
 
   const models = TIER_MODELS[tier] || TIER_MODELS.free;
@@ -115,7 +115,7 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
           // Fallback to gemini-2.0-flash if primary model is overloaded
           if (e.message && (e.message.includes('high demand') || e.message.includes('overloaded') || e.message.includes('503') || e.message.includes('UNAVAILABLE'))) {
             console.log('Gemini primary failed, falling back to gemini-2.0-flash');
-            return callGemini(fullPrompt, 'gemini-2.0-flash-lite', convHistory, KEYS.gemini, systemPrompt);
+            return callGemini(fullPrompt, 'gemini-2.5-flash-lite', convHistory, KEYS.gemini, systemPrompt);
           }
           throw e;
         }),
