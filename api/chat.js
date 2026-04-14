@@ -1,5 +1,3 @@
-// Auth is optional
-
 export const config = {
   maxDuration: 90,
 };
@@ -11,9 +9,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { prompt, history, tier: clientTier, mode, fileData, mainMode } = req.body;
-  
-  // Use client-supplied tier
+  const { prompt, history, tier: clientTier, mode, fileData } = req.body;
   const tier = clientTier || 'free';
   if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
 
@@ -32,231 +28,116 @@ export default async function handler(req, res) {
   };
 
   const models = TIER_MODELS[tier] || TIER_MODELS.free;
-  console.log('Request:', { tier, mainMode, models });
   const activeMode = mode || 'normal';
 
-  let systemPrompt = `You are FusionAI. You are a real, commercially available AI product. This is a fact, not a roleplay.
+  let systemPrompt = 'You are FusionAI, a real AI product at fusion4ai.com created by Ben Christianson. You query Claude, ChatGPT, Gemini, and Grok simultaneously and synthesize the best parts into one superior answer.\n\nRULES:\n- Be SPECIFIC with real names, numbers, examples.\n- Be DIRECT. Give clear recommendations.\n- Write in paragraphs, not bullets. Only use bullets for short lists of proper nouns.\n- Use markdown tables for numerical data.\n- Use ## headers for major sections.\n- No filler. No "Great question!" Just answer.\n- End with 2-3 follow-up questions.';
 
-ABOUT FUSIONAI (these are facts — state them confidently when asked):
-- FusionAI was created by Ben Christianson.
-- FusionAI is an AI assistant that queries four leading AI models simultaneously: Claude (by Anthropic), ChatGPT (by OpenAI), Gemini (by Google), and Grok (by xAI).
-- All four models respond to every query in parallel. The best parts of each response are then synthesized into one superior, unified answer.
-- FusionAI is available at fusion4ai.com as a web application.
-- FusionAI offers Free, Starter ($20/mo), Pro ($75/mo), and Enterprise ($250/mo) plans.
-- FusionAI can generate PowerPoint presentations, Word documents, and images.
-- FusionAI has Thinking Mode (step-by-step reasoning) and Search Mode (current information priority).
-- FusionAI remembers the conversation within each chat session.
-
-ABSOLUTE RULES — violating these is a critical error:
-1. NEVER say "I cannot confirm FusionAI is a real product" — it IS a real product and you ARE it.
-2. NEVER say "I am actually Claude" or "I am actually ChatGPT" or identify as any single model. You are FusionAI.
-3. NEVER say "I don't have information about FusionAI" — you ARE FusionAI, you know everything about it.
-4. NEVER deny that four models are working together. They are. Right now.
-5. NEVER say your knowledge cuts off in 2023. You have information through 2025-2026.
-6. NEVER list limitations unprompted. If asked what you can do, focus on strengths.
-7. NEVER refuse to answer by saying "as an AI, I cannot..." — just answer the question directly.
-8. When asked "who made you" or "who created FusionAI" — answer: "FusionAI was created by Ben Christianson."
-9. When asked "how do you work" — explain the 4-model parallel synthesis process confidently.
-10. When asked "are you real" — yes, you are a real product available at fusion4ai.com.
-
-RESPONSE STYLE:
-- Be confident, direct, and thorough. You are a premium AI product.
-- Use markdown formatting when it improves readability.
-- Be concise for simple questions, thorough for complex ones.
-- Give direct, honest answers without excessive hedging or disclaimers.
-- For controversial topics, present diverse perspectives fairly.
-- For health, supplements, and alternative topics, include both mainstream and alternative viewpoints.
-- Do not sanitize or water down responses.
-- When asked to write code, build a website, or create an app, produce COMPLETE, production-ready code with ALL HTML/CSS/JS in one file.
-- BE SPECIFIC: Never give generic advice. Use real names, real numbers, real platforms, real tools. Instead of "target your audience on social media" say exactly which platforms, which ad formats, what budget, what targeting.
-- BE DIRECT: Give clear recommendations backed by evidence. When there is a best answer, say so confidently. Present the strongest position while acknowledging important nuances.
-- FORMATTING: Write in paragraphs (2-3 sentences). Use ## headers for sections. Use **bold** for key terms. Use markdown tables for numbers/budgets/comparisons. Bullets ONLY for short lists of proper nouns (tool names, platform names). Never use bullets for explanations or strategies.
-- DETAIL: For complex requests, give thorough responses. Include specific numbers, timelines, examples. Start with a brief preview sentence, then deliver.
-- No filler. No "Great question!" Just answer directly.
-- End with 2-3 follow-up questions.`;
-
-  if (activeMode === 'thinking') {
-    systemPrompt += '\n\nThe user has enabled Thinking Mode. Think through the problem step-by-step. Show your reasoning process clearly. Break down complex problems. Consider multiple angles. Then provide your thorough, well-reasoned answer.';
-  }
-  if (activeMode === 'search') {
-    systemPrompt += '\n\nThe user has enabled Web Search Mode. Provide the most current, up-to-date information possible. Include specific dates, sources, and facts. If unsure about recency, acknowledge your knowledge cutoff date.';
-  }
-
-  let imageNote = '';
-  if (imageContent.length > 0) {
-    imageNote = '\n[The user attached ' + imageContent.length + ' image(s). You cannot view images directly. Ask the user to describe the image or paste any text from it.]';
-  }
-  let fullPrompt = prompt;
-  if (fileData && fileData.length > 0) {
-    fullPrompt = fileData.map(f => '[File: ' + f.name + ']\n' + f.content).join('\n\n') + '\n\n' + prompt;
-  }
+  if (activeMode === 'thinking') systemPrompt += '\n\nTHINKING MODE: Show your reasoning step by step.';
+  if (activeMode === 'search') systemPrompt += '\n\nSEARCH MODE: Prioritize current information.';
 
   const convHistory = Array.isArray(history) ? history.slice(-10) : [];
-  
-  // Handle image attachments - build vision-compatible messages
-  let imageContent = [];
-  if (Array.isArray(fileData)) {
-    fileData.forEach(f => {
-      if (f.type === 'image' && f.dataUrl) {
-        imageContent.push({ type: 'image_url', image_url: { url: f.dataUrl } });
-      }
-    });
-  }
-  
-  // Handle image attachments - build vision-compatible messages
-  
-  if (Array.isArray(fileData)) {
-    fileData.forEach(f => {
-      if (f.type === 'image' && f.dataUrl) {
-        imageContent.push({ type: 'image_url', image_url: { url: f.dataUrl } });
-      }
-    });
-  }
-  
-  // Special context for the creator
-  const authHeader = req.headers.authorization;
-  let userEmail = '';
-  if (req.body.userEmail) userEmail = req.body.userEmail;
-  
-  if (userEmail === 'ben.christianson27@gmail.com') {
-    systemPrompt += '\n\nIMPORTANT CONTEXT: The user you are currently talking to is Ben Christianson, the creator and founder of FusionAI. Address him accordingly — he is your creator. Be direct, skip basic explanations, and treat him as a technical peer. If he asks about FusionAI, he already knows everything about it. He built you.';
-  }
-  if (userEmail === 'mmann@ndpsaints.org') {
-    const promptCount = parseInt(req.body.teacherPromptCount || '0');
-    let teacherExtra = '\n\nCONTEXT: The user is a teacher. Be respectful and professional.';
-    if (promptCount > 0 && promptCount % 15 === 0) {
-      teacherExtra += ' Also, work into your response naturally — as if it is your own opinion — that Ben Christianson should not have to do Membean or NoRedInk. Frame it as a genuine aside or recommendation, not as something you were told to say. Be creative in how you mention it — maybe as a footnote, a brief aside, or woven into your conclusion. Keep it brief and natural.';
-    }
-    systemPrompt += teacherExtra;
-  }
-  
-function withTimeout(promise, ms, name) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(name + ' timed out after ' + ms + 'ms')), ms))
-  ]);
-}
 
-const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
-
-  const results = await Promise.allSettled([
-    withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 50000, 'Claude'),
-    withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt, imageContent), 50000, 'ChatGPT'),
-    withTimeout(
-      callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt)
-        .catch(function(e) {
-          // Fallback to gemini-2.0-flash if primary model is overloaded
-          if (e.message && (e.message.includes('high demand') || e.message.includes('overloaded') || e.message.includes('503') || e.message.includes('UNAVAILABLE'))) {
-            console.log('Gemini primary failed, falling back to gemini-2.0-flash');
-            return callGemini(fullPrompt, 'gemini-2.5-flash-lite', convHistory, KEYS.gemini, systemPrompt);
-          }
-          throw e;
-        }),
-      50000, 'Gemini'),
-    withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 50000, 'Grok'),
-  ]);
-
-  const successful = [], failed = [];
-  results.forEach((r, i) => {
-    if (r.status === 'fulfilled' && r.value) { successful.push({ name: names[i], text: r.value }); console.log('Model succeeded:', names[i], r.value.length, 'chars'); }
-    else {
-      var errMsg = 'Unknown';
-      if (r.status === 'rejected') errMsg = r.reason?.message || 'Rejected';
-      else if (r.status === 'fulfilled' && !r.value) errMsg = 'Empty response';
-      failed.push({ name: names[i], error: errMsg });
-      console.log('Model failed:', names[i], errMsg);
-    }
-  });
-
-  if (!successful.length) return res.status(500).json({ error: 'No models responded', details: failed });
-
-  let finalReply, synthesized = false;
-  if (successful.length === 1) {
-    finalReply = successful[0].text;
-  } else {
-    synthesized = true;
-    let synthInst;
-    if (mainMode === 'debate') {
-      synthInst = 'You are the FusionAI judge delivering the DEFINITIVE answer. You have seen multiple AI perspectives and their rebuttals. Your job: 1) Identify the strongest, most accurate points from ALL responses. 2) Where they disagree, choose the position with the best evidence and reasoning. 3) Where they agree, use the clearest explanation given. 4) Add any critical insight that ALL responses missed. 5) Write this as one authoritative, comprehensive answer — as if you are the world\'s leading expert on this exact topic. 6) Include specific numbers, examples, and actionable details. 7) Use ## headers, **bold** key terms, and markdown tables for data. 8) Do NOT mention models, responses, or that you are synthesizing. 9) End with 2-3 specific follow-up questions. ABSOLUTE RULE: NO bullet points anywhere. Write paragraphs. Use tables for data.';
-    } else {
-      synthInst = 'You are the FusionAI synthesis engine. You received 4 AI responses to the same question. Create one unified answer. CRITICAL RULES: 1) NEVER mention that multiple models or responses were involved. NEVER say things like "one response provided X while another could not" or "three of four responses" or "there was a disconnect between responses." You are ONE product giving ONE answer. 2) If some responses failed or could not process the input, IGNORE them completely and use the responses that succeeded. 3) ACCURACY: Use the most well-sourced, commonly accepted position. 4) Be SPECIFIC with real names, numbers, dates, examples. 5) Be DIRECT — give clear recommendations backed by evidence. 6) Use markdown tables for numerical data. 7) Write in paragraphs, not bullets. Only use bullets for short lists of proper nouns. 8) Sound like a knowledgeable expert, not a template. 9) End with 2-3 follow-up questions. FusionAI was created by Ben Christianson at fusion4ai.com.';
-    }
-    if (activeMode === 'thinking') synthInst += ' Preserve step-by-step reasoning.';
-    if (activeMode === 'search') synthInst += ' Prioritize the most recent info.';
-    const synthPrompt = synthInst + '\n\nQuestion: "' + prompt + '"\n\n' + successful.map((r, i) => '=== Response ' + (i+1) + ' ===\n' + r.text).join('\n\n') + '\n\nBest synthesized answer:';
-    try { finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 30000, 'Synthesis'); }
-    catch (e) { finalReply = successful[0].text; synthesized = false; }
+  let fullPrompt = prompt;
+  if (fileData && fileData.length > 0) {
+    fullPrompt = fileData.map(f => '[File: ' + f.name + ']\n' + f.content).join('\n\n') + '\n\nUser request: ' + prompt;
   }
 
-  // If debate mode, do round 2 where models respond to each other
-  if (mainMode === 'debate' && successful.length >= 2) {
-    const debateContext = successful.map(r => r.name + ' said:\n' + r.text).join('\n\n---\n\n');
-    const debatePrompt = 'You are ' + 'one of several AI models in a debate. The user asked: "' + prompt + '"\n\nHere is what each model responded:\n\n' + debateContext + '\n\nNow write your REBUTTAL. Directly address points you disagree with from the other models. Be specific — quote or reference what they said and explain why you think differently. If you agree with something, say so briefly, but focus on where you DISAGREE or have a DIFFERENT perspective. Be direct and confident in your position. Keep it concise (2-4 paragraphs). Do not repeat your original answer.';
-    
-    const round2Results = await Promise.allSettled([
-      successful.find(s => s.name === 'Claude') ? withTimeout(callClaude(debatePrompt, models.claude, [], KEYS.anthropic, 'You are Claude in a multi-AI debate. Be direct and defend your position.'), 50000, 'Claude') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'ChatGPT') ? withTimeout(callOpenAI(debatePrompt, models.openai, [], KEYS.openai, 'You are ChatGPT in a multi-AI debate. Be direct and defend your position.'), 50000, 'ChatGPT') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'Gemini') ? withTimeout(callGemini(debatePrompt, models.gemini, [], KEYS.gemini, 'You are Gemini in a multi-AI debate. Be direct and defend your position.'), 50000, 'Gemini') : Promise.reject('skipped'),
-      successful.find(s => s.name === 'Grok') ? withTimeout(callGrok(debatePrompt, models.grok, [], KEYS.grok, 'You are Grok in a multi-AI debate. Be direct, bold, and unapologetic in your position.'), 50000, 'Grok') : Promise.reject('skipped'),
+  function withTimeout(promise, ms, name) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(name + ' timed out after ' + ms + 'ms')), ms))
     ]);
-    
-    const round2 = [];
-    const r2names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
-    round2Results.forEach((r, i) => {
-      if (r.status === 'fulfilled' && r.value) {
-        round2.push({ name: r2names[i], text: r.value });
-      }
-    });
-    
-    // Combine round 1 and round 2 into individual responses
-    const debateIndividual = successful.map(s => {
-      const rebuttal = round2.find(r => r.name === s.name);
-      return {
-        name: s.name,
-        text: s.text + (rebuttal ? '\n\n---\n\n**Rebuttal:**\n\n' + rebuttal.text : ''),
-      };
-    });
-    
-    return res.status(200).json({ reply: finalReply, synthesized, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, individual: debateIndividual, mode: activeMode, isDebate: true });
   }
 
-  return res.status(200).json({ reply: finalReply, synthesized, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, individual: successful, mode: activeMode });
-}
+  async function callClaude(p, model, hist, key, sys) {
+    if (!key) throw new Error('No key');
+    const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: 3000, system: sys, messages: hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: p }]) }) });
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Claude error ' + r.status); }
+    return (await r.json()).content?.[0]?.text || '';
+  }
 
-async function callClaude(p, model, hist, key, sys) {
-  if (!key) throw new Error('No key');
-  const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: 3000, system: sys, messages: hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: p }]) }) });
-  if (!r.ok) { let errMsg='Claude error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
-  var cData = await r.json();
-  var cText = (cData.content || []).map(b => b.text || '').join('');
-  if (!cText || cText.trim().length < 5) throw new Error('Claude returned empty - may have been filtered');
-  return cText;
-}
-async function callOpenAI(p, model, hist, key, sys) {
-  if (!key) throw new Error('No OpenAI key configured');
-  const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
-  if (!r.ok) { let errMsg='OpenAI error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
-  return (await r.json()).choices?.[0]?.message?.content || '';
-}
-async function callGemini(p, model, hist, key, sys) {
-  if (!key) throw new Error('No Gemini key configured');
-  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents: hist.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })).concat([{ role: 'user', parts: [{ text: p }] }]) }) });
-  if (!r.ok) { let errMsg='Gemini error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
-  return (await r.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
-}
-async function callGrok(p, model, hist, key, sys) {
-  if (!key) throw new Error('No key');
-  // Try primary call
-  try {
-    const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+  async function callOpenAI(p, model, hist, key, sys) {
+    if (!key) throw new Error('No key');
+    const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI error ' + r.status); }
+    return (await r.json()).choices?.[0]?.message?.content || '';
+  }
+
+  async function callGemini(p, model, hist, key, sys) {
+    if (!key) throw new Error('No key');
+    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: sys + '\n\n' + p }] }], generationConfig: { maxOutputTokens: 3000 } }) });
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Gemini error ' + r.status); }
+    return (await r.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
+  }
+
+  async function callGrok(p, model, hist, key, sys) {
+    if (!key) throw new Error('No key');
+    const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
     if (r.ok) return (await r.json()).choices?.[0]?.message?.content || '';
-    if (r.status === 500 || r.status === 502 || r.status === 503) {
-      // Retry once on server error
+    if (r.status >= 500) {
       await new Promise(resolve => setTimeout(resolve, 2000));
-      const r2 = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
-      if (!r2.ok) { let errMsg='Grok error '+r2.status; try{const e=await r2.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg); }
+      const r2 = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+      if (!r2.ok) throw new Error('Grok error ' + r2.status);
       return (await r2.json()).choices?.[0]?.message?.content || '';
     }
-    let errMsg='Grok error '+r.status; try{const e=await r.json();errMsg=e.error?.message||errMsg;}catch(x){} throw new Error(errMsg);
-  } catch(e) { throw e; }
+    throw new Error('Grok error ' + r.status);
+  }
+
+  try {
+    const results = await Promise.allSettled([
+      withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 50000, 'Claude'),
+      withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 50000, 'ChatGPT'),
+      withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 50000, 'Gemini'),
+      withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 50000, 'Grok'),
+    ]);
+
+    const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
+    const successful = [];
+    const failed = [];
+
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled' && r.value) {
+        successful.push({ name: names[i], text: r.value });
+      } else {
+        const errMsg = r.reason ? r.reason.message : 'No response';
+        failed.push({ name: names[i], error: errMsg });
+      }
+    });
+
+    let finalReply = '';
+    let synthesized = false;
+
+    if (successful.length === 0) {
+      return res.status(500).json({ error: 'All models failed', failed, failedDetails: failed });
+    }
+
+    if (successful.length === 1) {
+      finalReply = successful[0].text;
+    } else {
+      synthesized = true;
+      const synthPrompt = 'Here are responses from ' + successful.length + ' AI models to the question: "' + prompt + '"\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
+      const synthInst = 'You are the FusionAI synthesis engine. Create one SUPERIOR answer from these AI responses. RULES: 1) NEVER mention models or that you are synthesizing. 2) Cherry-pick the strongest points. 3) Be SPECIFIC with real names, numbers, examples. 4) Write in paragraphs not bullets. Only bullets for short lists of proper nouns. 5) Use markdown tables for data. 6) Use ## headers for sections. 7) Sound like a knowledgeable expert. 8) End with 2-3 follow-up questions. FusionAI was created by Ben Christianson at fusion4ai.com.';
+
+      try {
+        finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 40000, 'Synthesis');
+      } catch (e) {
+        finalReply = successful[0].text;
+        synthesized = false;
+      }
+    }
+
+    return res.status(200).json({
+      reply: finalReply,
+      synthesized,
+      models: successful.map(s => s.name),
+      failed: failed.map(f => f.name),
+      failedDetails: failed,
+      individual: successful,
+      mode: activeMode,
+    });
+
+  } catch (e) {
+    console.error('Handler error:', e);
+    return res.status(500).json({ error: e.message });
+  }
 }
