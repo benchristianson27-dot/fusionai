@@ -1,4 +1,4 @@
-import { verifyAuth } from './auth.js';
+// Auth is optional
 
 export const config = {
   maxDuration: 90,
