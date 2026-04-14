@@ -143,6 +143,38 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
     catch (e) { finalReply = successful[0].text; synthesized = false; }
   }
 
+  // If debate mode, do round 2 where models respond to each other
+  if (mainMode === 'debate' && successful.length >= 2) {
+    const debateContext = successful.map(r => r.name + ' said:\n' + r.text).join('\n\n---\n\n');
+    const debatePrompt = 'You are ' + 'one of several AI models in a debate. The user asked: "' + prompt + '"\n\nHere is what each model responded:\n\n' + debateContext + '\n\nNow write your REBUTTAL. Directly address points you disagree with from the other models. Be specific — quote or reference what they said and explain why you think differently. If you agree with something, say so briefly, but focus on where you DISAGREE or have a DIFFERENT perspective. Be direct and confident in your position. Keep it concise (2-4 paragraphs). Do not repeat your original answer.';
+    
+    const round2Results = await Promise.allSettled([
+      successful.find(s => s.name === 'Claude') ? withTimeout(callClaude(debatePrompt, models.claude, [], KEYS.anthropic, 'You are Claude in a multi-AI debate. Be direct and defend your position.'), 30000, 'Claude') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'ChatGPT') ? withTimeout(callOpenAI(debatePrompt, models.openai, [], KEYS.openai, 'You are ChatGPT in a multi-AI debate. Be direct and defend your position.'), 30000, 'ChatGPT') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'Gemini') ? withTimeout(callGemini(debatePrompt, models.gemini, [], KEYS.gemini, 'You are Gemini in a multi-AI debate. Be direct and defend your position.'), 30000, 'Gemini') : Promise.reject('skipped'),
+      successful.find(s => s.name === 'Grok') ? withTimeout(callGrok(debatePrompt, models.grok, [], KEYS.grok, 'You are Grok in a multi-AI debate. Be direct, bold, and unapologetic in your position.'), 30000, 'Grok') : Promise.reject('skipped'),
+    ]);
+    
+    const round2 = [];
+    const r2names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
+    round2Results.forEach((r, i) => {
+      if (r.status === 'fulfilled' && r.value) {
+        round2.push({ name: r2names[i], text: r.value });
+      }
+    });
+    
+    // Combine round 1 and round 2 into individual responses
+    const debateIndividual = successful.map(s => {
+      const rebuttal = round2.find(r => r.name === s.name);
+      return {
+        name: s.name,
+        text: s.text + (rebuttal ? '\n\n---\n\n**Rebuttal:**\n\n' + rebuttal.text : ''),
+      };
+    });
+    
+    return res.status(200).json({ reply: finalReply, synthesized, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, individual: debateIndividual, mode: activeMode, isDebate: true });
+  }
+
   return res.status(200).json({ reply: finalReply, synthesized, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, individual: successful, mode: activeMode });
 }
 
