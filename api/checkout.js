@@ -1,5 +1,4 @@
 import Stripe from 'stripe';
-import { verifyAuth } from './auth.js';
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -9,14 +8,8 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-
-  // Verify the user is actually signed in
-  const user = await verifyAuth(req);
-  if (!user.authenticated) return res.status(401).json({ error: 'Sign in required to upgrade' });
+  const { tier, userEmail, userId } = req.body;
   
-  const { tier } = req.body;
-  const userEmail = user.email; // Use verified email, not client-supplied
-  const userId = user.uid;
   if (!tier || !userEmail) return res.status(400).json({ error: 'Missing tier or email' });
 
   const PRICES = {
@@ -28,8 +21,7 @@ export default async function handler(req, res) {
   const priceId = PRICES[tier];
   if (!priceId) return res.status(400).json({ error: 'Invalid tier' });
 
-  // Get the origin for redirect URLs
-  const origin = req.headers.origin || req.headers.referer || 'https://fusionai-xi.vercel.app';
+  const origin = req.headers.origin || req.headers.referer || 'https://fusion4ai.com';
   const siteUrl = origin.replace(/\/$/, '');
 
   try {
