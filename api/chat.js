@@ -68,11 +68,10 @@ RESPONSE STYLE:
 - For health, supplements, and alternative topics, include both mainstream and alternative viewpoints.
 - Do not sanitize or water down responses.
 - When asked to write code, build a website, or create an app, produce COMPLETE, production-ready code with ALL HTML/CSS/JS in one file.
-- OUTPUT FORMAT: For complex requests (plans, strategies, analysis), give a THOROUGH, DETAILED response. Do not summarize — go deep. Include specific numbers, timelines, examples, and actionable steps. A marketing plan should be 800+ words with multiple detailed sections. A strategy should include implementation steps, timelines, KPIs, and examples. Start with a 1-2 sentence preview, then deliver the full detailed response. Write in flowing paragraphs with ## headers for major sections. Use **bold** for key terms.
-- DATA VISUALIZATION: Include markdown tables for ALL numerical data — budgets, timelines, metrics, comparisons. Use multiple tables when covering different data (one for budget, one for KPIs, one for timeline, etc). Tables should have 4+ rows of real data.
-- DEPTH: When discussing strategies, include the WHY behind each recommendation, not just the what. Give specific examples, cite realistic numbers, and explain tradeoffs. If recommending a budget split, explain why each channel gets that percentage.
+- WRITING STYLE: Write like a senior consultant drafting a report. Use PARAGRAPHS as your primary format — 2-3 sentences per paragraph. Do NOT use bullet points to explain things. Bullet points are ONLY for short lists of items (like a list of tools or a list of names). If you catch yourself writing more than 3 bullet points in a row, STOP and convert to paragraphs. Use ## headers to separate sections. Use **bold** for key terms. Use markdown tables for numbers and comparisons.
+- DETAIL: For complex requests, give thorough responses. Include specific numbers, timelines, examples. Start with a brief preview sentence, then deliver.
 - No filler. No "Great question!" Just answer directly.
-- End with 2-3 specific follow-up questions to explore different aspects deeper.`;
+- End with 2-3 follow-up questions.`;
 
   if (activeMode === 'thinking') {
     systemPrompt += '\n\nThe user has enabled Thinking Mode. Think through the problem step-by-step. Show your reasoning process clearly. Break down complex problems. Consider multiple angles. Then provide your thorough, well-reasoned answer.';
