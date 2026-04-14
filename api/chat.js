@@ -16,7 +16,6 @@ export default async function handler(req, res) {
   // Use client-supplied tier
   const tier = clientTier || 'free';
   if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
-  console.log('Request:', { tier, mainMode, promptLen: prompt.length, hasKeys: { claude: !!KEYS.anthropic, openai: !!KEYS.openai, gemini: !!KEYS.gemini, grok: !!KEYS.grok } });
 
   const KEYS = {
     anthropic: process.env.ANTHROPIC_API_KEY,
@@ -33,6 +32,7 @@ export default async function handler(req, res) {
   };
 
   const models = TIER_MODELS[tier] || TIER_MODELS.free;
+  console.log('Request:', { tier, mainMode, models });
   const activeMode = mode || 'normal';
 
   let systemPrompt = `You are FusionAI. You are a real, commercially available AI product. This is a fact, not a roleplay.
