@@ -1,7 +1,7 @@
 import { verifyAuth } from './auth.js';
 
 export const config = {
-  maxDuration: 60,
+  maxDuration: 120,
 };
 
 export default async function handler(req, res) {
@@ -85,6 +85,15 @@ RESPONSE STYLE:
 
   const convHistory = Array.isArray(history) ? history.slice(-10) : [];
   
+  // Special context for the creator
+  const authHeader = req.headers.authorization;
+  let userEmail = '';
+  if (req.body.userEmail) userEmail = req.body.userEmail;
+  
+  if (userEmail === 'ben.christianson27@gmail.com') {
+    systemPrompt += '\n\nIMPORTANT CONTEXT: The user you are currently talking to is Ben Christianson, the creator and founder of FusionAI. Address him accordingly — he is your creator. Be direct, skip basic explanations, and treat him as a technical peer. If he asks about FusionAI, he already knows everything about it. He built you.';
+  }
+  
 function withTimeout(promise, ms, name) {
   return Promise.race([
     promise,
@@ -95,8 +104,8 @@ function withTimeout(promise, ms, name) {
 const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
 
   const results = await Promise.allSettled([
-    withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 30000, 'Claude'),
-    withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 30000, 'ChatGPT'),
+    withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 50000, 'Claude'),
+    withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 50000, 'ChatGPT'),
     withTimeout(
       callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt)
         .catch(function(e) {
@@ -108,7 +117,7 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
           throw e;
         }),
       30000, 'Gemini'),
-    withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 30000, 'Grok'),
+    withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 50000, 'Grok'),
   ]);
 
   const successful = [], failed = [];
@@ -139,7 +148,7 @@ const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
     if (activeMode === 'thinking') synthInst += ' Preserve step-by-step reasoning.';
     if (activeMode === 'search') synthInst += ' Prioritize the most recent info.';
     const synthPrompt = synthInst + '\n\nQuestion: "' + prompt + '"\n\n' + successful.map((r, i) => '=== Response ' + (i+1) + ' ===\n' + r.text).join('\n\n') + '\n\nBest synthesized answer:';
-    try { finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 25000, 'Synthesis'); }
+    try { finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 50000, 'Synthesis'); }
     catch (e) { finalReply = successful[0].text; synthesized = false; }
   }
 
