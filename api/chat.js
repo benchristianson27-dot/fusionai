@@ -194,6 +194,12 @@ function analyzeTone(prompt) {
       + 'End with 1-2 follow-up questions if relevant. ';
   }
 
+  // Formatting rules (apply to all tiers)
+  instructions += 'FORMAT: Write in paragraphs by default, NOT bullet points. '
+    + 'Bullet points should be rare — only for short lists of proper nouns or sequential steps. '
+    + 'When comparing things, showing data, or presenting structured info, use MARKDOWN TABLES. '
+    + 'Tables are better than bullet lists for comparisons, pricing, schedules, pros/cons, and any multi-column data. ';
+
   return { instructions, toneTier, isTechnical, wantsQuick };
 }
 
@@ -397,8 +403,11 @@ export default async function handler(req, res) {
           + '3) Keep the response proportional to the question — short question = concise answer. '
           + '4) Use concrete examples relevant to the user\'s apparent context. '
           + '5) Only ask a follow-up question if it genuinely helps them. Skip it for simple questions. '
-          + (toneHints.toneTier === 'casual' ? '6) This user is very casual — NO headers, NO formal structure, keep it conversational. ' : '')
-          + (toneHints.toneTier === 'professional' ? '6) This requires PROFESSIONAL output — formal language, no slang, treat user as a peer. ' : '')
+          + '6) FORMATTING: Write in PARAGRAPHS, not bullet points. Bullet points should be rare — only for short lists of 3-5 proper nouns or steps. '
+          + 'Use markdown TABLES when comparing items, showing data, or presenting options side-by-side. '
+          + 'Tables are almost always better than bullet lists for structured information. '
+          + (toneHints.toneTier === 'casual' ? '7) This user is very casual — NO headers, NO formal structure, keep it conversational. ' : '')
+          + (toneHints.toneTier === 'professional' ? '7) This requires PROFESSIONAL output — formal language, no slang, treat user as a peer. ' : '')
           + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
         try {
           finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 30000, 'Synthesis');
@@ -448,7 +457,10 @@ export default async function handler(req, res) {
           + 'If they seem technical, use precise terminology. '
           + '3) Be SPECIFIC — use real names, numbers, concrete examples relevant to the user\'s context. '
           + '4) Use ## headers ONLY for long responses (4+ distinct sections). For shorter answers, just use paragraphs. '
-          + '5) Use markdown tables only for actual data comparisons, not for everything. '
+          + '5) FORMATTING IS CRITICAL: Write in PARAGRAPHS as the default. Do NOT use bullet points unless listing 3-5 short proper nouns or sequential steps. '
+          + 'When presenting comparisons, options, data, numbers, schedules, or any structured information, use MARKDOWN TABLES instead of bullet lists. '
+          + 'Tables are cleaner and more professional than bullets for any side-by-side or multi-column information. '
+          + 'If the topic involves numbers, percentages, prices, or metrics, ALWAYS present them in a table. '
           + '6) Include concrete, specific examples — not generic advice. If they mention a bakery, use bakery examples. '
           + 'If they mention construction, use construction examples. '
           + '7) Follow-up questions: ask 1-2 only if they genuinely help. For straightforward requests, skip them. '
