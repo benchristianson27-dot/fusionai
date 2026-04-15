@@ -103,73 +103,80 @@ function analyzeTone(prompt) {
   const words = p.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
 
-  // Detect casual/informal writing
-  const casualSignals = [
-    /\bu\b/i, /\bur\b/i, /\bpls\b/i, /\bthx\b/i, /\bimo\b/i, /\btbh\b/i,
-    /\blol\b/i, /\blmao\b/i, /\bidk\b/i, /\bomg\b/i, /\bbtw\b/i, /\brn\b/i,
-    /\bwanna\b/i, /\bgonna\b/i, /\bgotta\b/i, /\bkinda\b/i, /\bsorta\b/i,
-    /\bim\b/, /\bdont\b/, /\bcant\b/, /\bwont\b/, /\bwhats\b/, /\bhows\b/,
-    /\baint\b/i, /\byall\b/i, /\bbruh\b/i, /\bdude\b/i, /\bbro\b/i,
-  ];
-  const casualCount = casualSignals.filter(rx => rx.test(p)).length;
-  const hasNoCaps = p === lower;
-  const hasNoEndPunctuation = !/[.!?]$/.test(p.trim());
-  const shortSentences = wordCount < 20;
+  // ── Detect if the prompt asks for PROFESSIONAL OUTPUT ──
+  // These are tasks where the OUTPUT must be professional regardless of how the user types.
+  // "write me an email", "draft a letter", "create a contract" → professional output needed
+  const wantsProfessionalOutput = /\b(draft|write|compose|create|prepare)\b.{0,30}\b(email|letter|memo|report|contract|proposal|bio|resume|cover letter|invoice|quote|template|form|statement|newsletter|announcement|handbook|manual|policy|brief|pitch|press release|abstract|summary|review)\b/i.test(lower)
+    || /\b(client|customer|patient|colleague|supervisor|manager|employer|attorney|doctor|staff|parent|investor|stakeholder)\b/i.test(lower)
+    || /\b(professional|formal|business|corporate|official|legal|medical|clinical|academic|scientific)\b/i.test(lower);
 
-  // Detect formal/professional writing
-  const formalSignals = [
-    /\bplease\b/i, /\bregarding\b/i, /\bcould you\b/i, /\bwould you\b/i,
-    /\bI would like\b/i, /\bI am\b/, /\bprofessional\b/i, /\bcomprehensive\b/i,
+  // ── Detect professional/serious DOMAIN knowledge ──
+  // Topics where accuracy and clarity matter more than matching casual vibes
+  const professionalDomain = /\b(osha|nec|hipaa|compliance|regulation|deduction|tax|filing|diagnosis|sepsis|clinical|patient|liability|tort|statute|fiduciary|gaap|audit|amortiz|depreciat|nfpa|cfr|code\s+section|mediation|litigation|custody|divorce|asylum|refugee|immigration|dispensary|cannabis|pharmaceutical|prescription|surgery|veterinar|embalm|funeral|mortgage|underwriting|fiduciary|escrow|appraisal|scaffold|incident\s+report|intake\s+form|grant\s+title|species\s+distribution|coral\s+reef|microplastic)\b/i.test(lower);
+
+  // ── Detect STRONG casual signals ──
+  // Only count genuinely casual markers (not just lowercase/no punctuation)
+  const strongCasualSignals = [
+    /\bu\b(?!\.\s*s)/i, /\bur\b/i, /\bpls\b/i, /\bthx\b/i, /\btbh\b/i,
+    /\blol\b/i, /\blmao\b/i, /\bidk\b/i, /\bomg\b/i, /\bbtw\b/i,
+    /\bwanna\b/i, /\bgonna\b/i, /\bgotta\b/i, /\bkinda\b/i, /\bsorta\b/i,
+    /\baint\b/i, /\byall\b/i, /\bbruh\b/i, /\bdude\b/i, /\bbro\b/i,
+    /\bfr fr\b/i, /\bno cap\b/i, /\blowkey\b/i, /\bhighkey\b/i,
+    /like im not a genius/i, /like im \d/i, /explain.+like im/i,
   ];
-  const formalCount = formalSignals.filter(rx => rx.test(p)).length;
-  const startsCapitalized = /^[A-Z]/.test(p);
-  const hasProperPunctuation = /[.!?]$/.test(p.trim());
+  const casualCount = strongCasualSignals.filter(rx => rx.test(p)).length;
 
   // Detect technical writing
   const techSignals = /\b(api|sql|css|html|react|python|node|docker|kubernetes|regex|oauth|jwt|graphql|typescript|webpack|nginx|redis|postgres|mongodb|cicd|devops|github|npm|pip|async|await|function|const|let|var|useState|useEffect|component|endpoint|middleware|backend|frontend|deploy|repository|commit|merge|branch)\b/i;
   const isTechnical = techSignals.test(lower);
 
-  // Detect professional/serious subject matter (should stay clear even if typed casually)
-  const professionalContent = /\b(osha|nec|hipaa|compliance|regulation|deduction|tax|filing|diagnosis|sepsis|clinical|patient|liability|tort|statute|fiduciary|gaap|audit|amortiz|depreciat|nfpa|irc\s*§|cfr|code\s+section)\b/i.test(lower);
-
-  // Score: negative = casual, positive = formal
-  let formalScore = 0;
-  formalScore -= casualCount * 2;
-  formalScore -= hasNoCaps ? 1 : 0;
-  formalScore -= hasNoEndPunctuation ? 1 : 0;
-  formalScore -= shortSentences ? 0.5 : 0;
-  formalScore += formalCount * 2;
-  formalScore += startsCapitalized ? 0.5 : 0;
-  formalScore += hasProperPunctuation ? 0.5 : 0;
-  formalScore += isTechnical ? 1 : 0;
-  // Professional content bumps toward moderate even if typed casually
-  if (professionalContent && formalScore < 0) formalScore = Math.min(formalScore + 2, 0);
-
   // Detect if they want something quick vs detailed
   const wantsQuick = /\b(quick|fast|brief|short|simple|easy|just|basic)\b/i.test(lower);
   const wantsDetailed = /\b(detailed|comprehensive|thorough|in[- ]depth|complete|full|extensive|everything)\b/i.test(lower);
 
+  // ── Decide tone tier ──
+  // The key insight: default to PROFESSIONAL. Only go casual if there are
+  // strong casual signals AND the content isn't professional in nature.
+  let toneTier;
+
+  if (wantsProfessionalOutput || professionalDomain) {
+    // Professional output requested or professional domain → always professional tone
+    // Even if they type "yo write me an email to my client" → the EMAIL should be professional
+    toneTier = 'professional';
+  } else if (isTechnical) {
+    toneTier = 'technical';
+  } else if (casualCount >= 2) {
+    // Multiple strong casual signals + no professional context → casual is OK
+    toneTier = 'casual';
+  } else if (casualCount === 1 && wordCount <= 12) {
+    // One casual signal in a short message → casual
+    toneTier = 'casual';
+  } else {
+    // Default: friendly but clear. This is the safe middle ground.
+    toneTier = 'balanced';
+  }
+
   let instructions = '';
 
-  // Tone matching
-  if (formalScore <= -2) {
-    // Very casual user
-    instructions += 'TONE: The user writes casually. Match their energy — use simple, conversational language. '
-      + 'Keep sentences short. No markdown headers. No formal structure. '
-      + 'Talk like a knowledgeable friend, not a professor. ';
-  } else if (formalScore <= 0) {
-    // Moderately casual
-    instructions += 'TONE: Write in a friendly, approachable way. Use clear language without jargon. '
-      + 'Only use ## headers if the response is long enough to need sections (4+ paragraphs). ';
-  } else if (isTechnical) {
-    // Technical user
+  if (toneTier === 'casual') {
+    instructions += 'TONE: The user writes very casually. Use simple, conversational language. '
+      + 'Keep sentences short. Skip markdown headers unless the response is very long. '
+      + 'Talk like a knowledgeable friend, not a professor. '
+      + 'But stay CLEAR and ACCURATE — casual tone does not mean vague answers. ';
+  } else if (toneTier === 'technical') {
     instructions += 'TONE: The user is technical. Be precise and use proper terminology. '
       + 'Include code examples or specific technical details where relevant. '
       + 'Use ## headers for organization. ';
+  } else if (toneTier === 'professional') {
+    instructions += 'TONE: This requires professional-quality output. Write clearly and formally. '
+      + 'Use proper terminology for the domain. Do NOT use slang, casual language, or informal phrasing. '
+      + 'Treat the user as a professional peer. Structure the response well. '
+      + 'If drafting content for the user (emails, letters, reports), make it ready to use as-is. ';
   } else {
-    // Formal/professional user
-    instructions += 'TONE: Write professionally and clearly. '
-      + 'Use ## headers for longer responses. Use concrete examples and specific details. ';
+    // balanced
+    instructions += 'TONE: Write in a friendly, clear, approachable way. '
+      + 'Be helpful without being overly formal or overly casual. '
+      + 'Only use ## headers if the response needs multiple distinct sections. ';
   }
 
   // Length matching
@@ -187,7 +194,7 @@ function analyzeTone(prompt) {
       + 'End with 1-2 follow-up questions if relevant. ';
   }
 
-  return { instructions, formalScore, isTechnical, wantsQuick };
+  return { instructions, toneTier, isTechnical, wantsQuick };
 }
 
 
@@ -390,7 +397,8 @@ export default async function handler(req, res) {
           + '3) Keep the response proportional to the question — short question = concise answer. '
           + '4) Use concrete examples relevant to the user\'s apparent context. '
           + '5) Only ask a follow-up question if it genuinely helps them. Skip it for simple questions. '
-          + (toneHints.formalScore <= -2 ? '6) This user is very casual — NO headers, NO formal structure, keep it conversational. ' : '')
+          + (toneHints.toneTier === 'casual' ? '6) This user is very casual — NO headers, NO formal structure, keep it conversational. ' : '')
+          + (toneHints.toneTier === 'professional' ? '6) This requires PROFESSIONAL output — formal language, no slang, treat user as a peer. ' : '')
           + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
         try {
           finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 30000, 'Synthesis');
@@ -445,8 +453,9 @@ export default async function handler(req, res) {
           + 'If they mention construction, use construction examples. '
           + '7) Follow-up questions: ask 1-2 only if they genuinely help. For straightforward requests, skip them. '
           + 'Never ask follow-up questions that just restate what the user already told you. '
-          + (toneHints.formalScore <= -2 ? '8) This user is very casual — keep it conversational, skip headers and formal structure. ' : '')
-          + (toneHints.wantsQuick ? '8) The user wants a QUICK answer — be concise. ' : '')
+          + (toneHints.toneTier === 'casual' ? '8) This user is very casual — keep it conversational, skip headers and formal structure. ' : '')
+          + (toneHints.toneTier === 'professional' ? '8) This requires PROFESSIONAL output — use formal language, proper domain terminology, no slang. Treat user as a professional peer. ' : '')
+          + (toneHints.wantsQuick ? '9) The user wants a QUICK answer — be concise. ' : '')
           + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
 
         try {
