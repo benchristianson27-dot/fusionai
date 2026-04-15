@@ -1,5 +1,6 @@
 export const config = {
   maxDuration: 90,
+  api: { bodyParser: { sizeLimit: '10mb' } },
 };
 
 // ── Query Complexity Classification ──
@@ -129,9 +130,14 @@ export default async function handler(req, res) {
   const complexity = classifyQuery(prompt, convHistory, fileData, mainMode);
   const systemPrompt = buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount);
 
+  // ── Extract image data from fileData ──
+  const images = (fileData || []).filter(f => f.type === 'image' && f.imageBase64);
+  const textFiles = (fileData || []).filter(f => f.type !== 'image');
+  const hasImages = images.length > 0;
+
   let fullPrompt = prompt;
-  if (fileData && fileData.length > 0) {
-    fullPrompt = fileData.map(f => '[File: ' + f.name + ']\n' + f.content).join('\n\n') + '\n\nUser request: ' + prompt;
+  if (textFiles.length > 0) {
+    fullPrompt = textFiles.map(f => '[File: ' + f.name + ']\n' + f.content).join('\n\n') + '\n\nUser request: ' + prompt;
   }
 
   // ── Timeout helper ──
@@ -142,35 +148,79 @@ export default async function handler(req, res) {
     ]);
   }
 
-  // ── API Callers ──
+  // ── Build vision-aware user message content per API format ──
+
+  // Claude format: array of content blocks
+  function buildClaudeContent(text) {
+    const parts = [];
+    images.forEach(img => {
+      const mime = img.imageMime || 'image/png';
+      // Claude accepts: image/jpeg, image/png, image/gif, image/webp
+      const safeMime = ['image/jpeg','image/png','image/gif','image/webp'].includes(mime) ? mime : 'image/png';
+      parts.push({ type: 'image', source: { type: 'base64', media_type: safeMime, data: img.imageBase64 } });
+    });
+    parts.push({ type: 'text', text: text });
+    return parts;
+  }
+
+  // OpenAI / Grok format: array with image_url and text
+  function buildOpenAIContent(text) {
+    const parts = [];
+    images.forEach(img => {
+      const mime = img.imageMime || 'image/png';
+      parts.push({ type: 'image_url', image_url: { url: 'data:' + mime + ';base64,' + img.imageBase64 } });
+    });
+    parts.push({ type: 'text', text: text });
+    return parts;
+  }
+
+  // Gemini format: array of parts with inline_data
+  function buildGeminiParts(text) {
+    const parts = [];
+    images.forEach(img => {
+      const mime = img.imageMime || 'image/png';
+      parts.push({ inline_data: { mime_type: mime, data: img.imageBase64 } });
+    });
+    parts.push({ text: text });
+    return parts;
+  }
+
+  // ── API Callers (vision-aware) ──
   async function callClaude(p, model, hist, key, sys) {
     if (!key) throw new Error('No key');
-    const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: 3000, system: sys, messages: hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: p }]) }) });
+    const userContent = hasImages ? buildClaudeContent(p) : p;
+    const messages = hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: userContent }]);
+    const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: 3000, system: sys, messages }) });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Claude error ' + r.status); }
     return (await r.json()).content?.[0]?.text || '';
   }
 
   async function callOpenAI(p, model, hist, key, sys) {
     if (!key) throw new Error('No key');
-    const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+    const userContent = hasImages ? buildOpenAIContent(p) : p;
+    const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
+    const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages }) });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI error ' + r.status); }
     return (await r.json()).choices?.[0]?.message?.content || '';
   }
 
   async function callGemini(p, model, hist, key, sys) {
     if (!key) throw new Error('No key');
-    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: sys + '\n\n' + p }] }], generationConfig: { maxOutputTokens: 3000 } }) });
+    const parts = hasImages ? buildGeminiParts(sys + '\n\n' + p) : [{ text: sys + '\n\n' + p }];
+    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { maxOutputTokens: 3000 } }) });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Gemini error ' + r.status); }
     return (await r.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
   }
 
   async function callGrok(p, model, hist, key, sys) {
     if (!key) throw new Error('No key');
-    const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+    const userContent = hasImages ? buildOpenAIContent(p) : p;
+    const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
+    const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages }) });
     if (r.ok) return (await r.json()).choices?.[0]?.message?.content || '';
     if (r.status >= 500) {
       await new Promise(resolve => setTimeout(resolve, 2000));
-      const r2 = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages: [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: p }]) }) });
+      const r2 = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages }) });
       if (!r2.ok) throw new Error('Grok error ' + r2.status);
       return (await r2.json()).choices?.[0]?.message?.content || '';
     }
