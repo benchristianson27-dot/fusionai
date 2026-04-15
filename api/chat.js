@@ -54,27 +54,27 @@ function classifyQuery(prompt, history, fileData, mainMode) {
   return 'complex';
 }
 
-// Build a system prompt that matches the query complexity
-function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount) {
+// Build a system prompt that matches the query complexity AND adapts to user's tone
+function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount, prompt) {
+  // Analyze the user's writing style from their prompt
+  const toneHints = analyzeTone(prompt);
   let sys;
 
   if (complexity === 'simple') {
-    sys = 'You are FusionAI, a real AI product at fusion4ai.com created by Ben Christianson. '
+    sys = 'You are FusionAI, an AI assistant at fusion4ai.com created by Ben Christianson. '
         + 'Respond naturally and conversationally. Keep it brief — match the energy and length of the user\'s message. '
         + 'If they say hi, just say hi back warmly in 1-2 sentences. Do NOT over-explain what you are or how you work unless asked. '
-        + 'Do NOT end with follow-up questions for casual messages.';
+        + 'Do NOT end with follow-up questions for casual messages. Do NOT use markdown headers.';
   } else if (complexity === 'medium') {
-    sys = 'You are FusionAI, a real AI product at fusion4ai.com created by Ben Christianson. '
-        + 'Give a clear, helpful answer. Be specific and direct. Use paragraphs, not bullets (unless listing proper nouns). '
-        + 'Keep the response focused and proportional to the question — don\'t over-elaborate on simple questions. '
-        + 'End with 1 brief follow-up question if the topic warrants it.';
+    sys = 'You are FusionAI, an AI assistant at fusion4ai.com created by Ben Christianson. '
+        + 'Give a clear, helpful answer. Be specific and direct. '
+        + 'Keep the response focused and proportional to the question — don\'t over-elaborate. '
+        + toneHints.instructions;
   } else {
-    sys = 'You are FusionAI, a real AI product at fusion4ai.com created by Ben Christianson. '
-        + 'You query Claude, ChatGPT, Gemini, and Grok simultaneously and synthesize the best parts into one superior answer. '
-        + 'RULES: Be SPECIFIC with real names, numbers, examples. Be DIRECT with clear recommendations. '
-        + 'Write in paragraphs not bullets. Only use bullets for short lists of proper nouns. '
-        + 'Use markdown tables for numerical data. Use ## headers for sections. No filler. '
-        + 'End with 2-3 follow-up questions.';
+    sys = 'You are FusionAI, an AI assistant at fusion4ai.com created by Ben Christianson. '
+        + 'Give thorough, expert-level answers with real names, numbers, and concrete examples. '
+        + 'Be direct with clear recommendations. '
+        + toneHints.instructions;
   }
 
   if (activeMode === 'thinking') sys += ' THINKING MODE: Show your reasoning step by step.';
@@ -94,6 +94,100 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
   }
 
   return sys;
+}
+
+// Analyze user's writing style to determine appropriate response tone
+function analyzeTone(prompt) {
+  const p = prompt.trim();
+  const lower = p.toLowerCase();
+  const words = p.split(/\s+/).filter(Boolean);
+  const wordCount = words.length;
+
+  // Detect casual/informal writing
+  const casualSignals = [
+    /\bu\b/i, /\bur\b/i, /\bpls\b/i, /\bthx\b/i, /\bimo\b/i, /\btbh\b/i,
+    /\blol\b/i, /\blmao\b/i, /\bidk\b/i, /\bomg\b/i, /\bbtw\b/i, /\brn\b/i,
+    /\bwanna\b/i, /\bgonna\b/i, /\bgotta\b/i, /\bkinda\b/i, /\bsorta\b/i,
+    /\bim\b/, /\bdont\b/, /\bcant\b/, /\bwont\b/, /\bwhats\b/, /\bhows\b/,
+    /\baint\b/i, /\byall\b/i, /\bbruh\b/i, /\bdude\b/i, /\bbro\b/i,
+  ];
+  const casualCount = casualSignals.filter(rx => rx.test(p)).length;
+  const hasNoCaps = p === lower;
+  const hasNoEndPunctuation = !/[.!?]$/.test(p.trim());
+  const shortSentences = wordCount < 20;
+
+  // Detect formal/professional writing
+  const formalSignals = [
+    /\bplease\b/i, /\bregarding\b/i, /\bcould you\b/i, /\bwould you\b/i,
+    /\bI would like\b/i, /\bI am\b/, /\bprofessional\b/i, /\bcomprehensive\b/i,
+  ];
+  const formalCount = formalSignals.filter(rx => rx.test(p)).length;
+  const startsCapitalized = /^[A-Z]/.test(p);
+  const hasProperPunctuation = /[.!?]$/.test(p.trim());
+
+  // Detect technical writing
+  const techSignals = /\b(api|sql|css|html|react|python|node|docker|kubernetes|regex|oauth|jwt|graphql|typescript|webpack|nginx|redis|postgres|mongodb|cicd|devops|github|npm|pip|async|await|function|const|let|var|useState|useEffect|component|endpoint|middleware|backend|frontend|deploy|repository|commit|merge|branch)\b/i;
+  const isTechnical = techSignals.test(lower);
+
+  // Detect professional/serious subject matter (should stay clear even if typed casually)
+  const professionalContent = /\b(osha|nec|hipaa|compliance|regulation|deduction|tax|filing|diagnosis|sepsis|clinical|patient|liability|tort|statute|fiduciary|gaap|audit|amortiz|depreciat|nfpa|irc\s*§|cfr|code\s+section)\b/i.test(lower);
+
+  // Score: negative = casual, positive = formal
+  let formalScore = 0;
+  formalScore -= casualCount * 2;
+  formalScore -= hasNoCaps ? 1 : 0;
+  formalScore -= hasNoEndPunctuation ? 1 : 0;
+  formalScore -= shortSentences ? 0.5 : 0;
+  formalScore += formalCount * 2;
+  formalScore += startsCapitalized ? 0.5 : 0;
+  formalScore += hasProperPunctuation ? 0.5 : 0;
+  formalScore += isTechnical ? 1 : 0;
+  // Professional content bumps toward moderate even if typed casually
+  if (professionalContent && formalScore < 0) formalScore = Math.min(formalScore + 2, 0);
+
+  // Detect if they want something quick vs detailed
+  const wantsQuick = /\b(quick|fast|brief|short|simple|easy|just|basic)\b/i.test(lower);
+  const wantsDetailed = /\b(detailed|comprehensive|thorough|in[- ]depth|complete|full|extensive|everything)\b/i.test(lower);
+
+  let instructions = '';
+
+  // Tone matching
+  if (formalScore <= -2) {
+    // Very casual user
+    instructions += 'TONE: The user writes casually. Match their energy — use simple, conversational language. '
+      + 'Keep sentences short. No markdown headers. No formal structure. '
+      + 'Talk like a knowledgeable friend, not a professor. ';
+  } else if (formalScore <= 0) {
+    // Moderately casual
+    instructions += 'TONE: Write in a friendly, approachable way. Use clear language without jargon. '
+      + 'Only use ## headers if the response is long enough to need sections (4+ paragraphs). ';
+  } else if (isTechnical) {
+    // Technical user
+    instructions += 'TONE: The user is technical. Be precise and use proper terminology. '
+      + 'Include code examples or specific technical details where relevant. '
+      + 'Use ## headers for organization. ';
+  } else {
+    // Formal/professional user
+    instructions += 'TONE: Write professionally and clearly. '
+      + 'Use ## headers for longer responses. Use concrete examples and specific details. ';
+  }
+
+  // Length matching
+  if (wantsQuick) {
+    instructions += 'LENGTH: The user wants a quick answer. Be concise — get to the point fast. '
+      + 'Skip the preamble. Only add follow-up questions if truly relevant. ';
+  } else if (wantsDetailed) {
+    instructions += 'LENGTH: The user wants depth. Give a thorough answer with examples. '
+      + 'End with 2-3 follow-up questions. ';
+  } else if (wordCount <= 10) {
+    instructions += 'LENGTH: Short question = proportional answer. Don\'t over-elaborate. '
+      + 'Only ask 1 follow-up question if it adds value. ';
+  } else {
+    instructions += 'LENGTH: Match your response length to the complexity of the question. '
+      + 'End with 1-2 follow-up questions if relevant. ';
+  }
+
+  return { instructions, formalScore, isTechnical, wantsQuick };
 }
 
 
@@ -128,7 +222,7 @@ export default async function handler(req, res) {
 
   // ── Smart Query Classification ──
   const complexity = classifyQuery(prompt, convHistory, fileData, mainMode);
-  const systemPrompt = buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount);
+  const systemPrompt = buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount, prompt);
 
   // ── Extract image data from fileData ──
   const images = (fileData || []).filter(f => f.type === 'image' && f.imageBase64);
@@ -287,10 +381,17 @@ export default async function handler(req, res) {
         finalReply = successful[0].text;
       } else {
         synthesized = true;
-        const synthPrompt = 'Here are responses from 2 AI models to the question: "' + prompt + '"\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
-        const synthInst = 'You are the FusionAI synthesis engine. Create one clean answer from these AI responses. '
-          + 'RULES: 1) NEVER mention models or synthesis. 2) Be specific and direct. 3) Keep response proportional to the question — don\'t over-elaborate. '
-          + '4) Write in paragraphs not bullets. 5) End with 1 follow-up question if relevant. FusionAI was created by Ben Christianson at fusion4ai.com.';
+        const synthPrompt = 'The user asked: "' + prompt + '"\n\nHere are responses from 2 AI models:\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
+        const toneHints = analyzeTone(prompt);
+        const synthInst = 'You are the FusionAI synthesis engine. Combine these responses into one clean answer. '
+          + 'CRITICAL RULES: 1) NEVER mention models, synthesis, or that multiple AIs were used. '
+          + '2) MIRROR THE USER\'S TONE. If they write casually (lowercase, slang, short sentences), respond the same way. '
+          + 'If they write formally, match that. Read their message carefully and write like you\'re talking to THEM specifically. '
+          + '3) Keep the response proportional to the question — short question = concise answer. '
+          + '4) Use concrete examples relevant to the user\'s apparent context. '
+          + '5) Only ask a follow-up question if it genuinely helps them. Skip it for simple questions. '
+          + (toneHints.formalScore <= -2 ? '6) This user is very casual — NO headers, NO formal structure, keep it conversational. ' : '')
+          + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
         try {
           finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 30000, 'Synthesis');
         } catch (e) {
@@ -327,12 +428,26 @@ export default async function handler(req, res) {
         finalReply = successful[0].text;
       } else {
         synthesized = true;
-        const synthPrompt = 'Here are responses from ' + successful.length + ' AI models to the question: "' + prompt + '"\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
+        const synthPrompt = 'The user asked: "' + prompt + '"\n\nHere are responses from ' + successful.length + ' AI models:\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
+        const toneHints = analyzeTone(prompt);
         const synthInst = 'You are the FusionAI synthesis engine. Create one SUPERIOR answer from these AI responses. '
-          + 'RULES: 1) NEVER mention models or that you are synthesizing. 2) If some responses failed or could not process input, IGNORE them and use what worked. '
-          + '3) Be SPECIFIC with real names, numbers, examples. 4) Write in paragraphs not bullets. Only bullets for short lists of proper nouns. '
-          + '5) Use markdown tables for data. 6) Use ## headers for sections. 7) Sound like a knowledgeable expert. '
-          + '8) End with 2-3 follow-up questions. FusionAI was created by Ben Christianson at fusion4ai.com.';
+          + 'CRITICAL RULES: '
+          + '1) NEVER mention models, synthesis, or that multiple AIs were used. '
+          + '2) MIRROR THE USER\'S TONE AND STYLE. This is the most important rule. '
+          + 'Read the user\'s message carefully — if they use casual language (lowercase, abbreviations, slang), '
+          + 'respond conversationally like a knowledgeable friend. If they write professionally, match that formality. '
+          + 'If they seem like a non-expert, avoid jargon or explain any technical terms you use. '
+          + 'If they seem technical, use precise terminology. '
+          + '3) Be SPECIFIC — use real names, numbers, concrete examples relevant to the user\'s context. '
+          + '4) Use ## headers ONLY for long responses (4+ distinct sections). For shorter answers, just use paragraphs. '
+          + '5) Use markdown tables only for actual data comparisons, not for everything. '
+          + '6) Include concrete, specific examples — not generic advice. If they mention a bakery, use bakery examples. '
+          + 'If they mention construction, use construction examples. '
+          + '7) Follow-up questions: ask 1-2 only if they genuinely help. For straightforward requests, skip them. '
+          + 'Never ask follow-up questions that just restate what the user already told you. '
+          + (toneHints.formalScore <= -2 ? '8) This user is very casual — keep it conversational, skip headers and formal structure. ' : '')
+          + (toneHints.wantsQuick ? '8) The user wants a QUICK answer — be concise. ' : '')
+          + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
 
         try {
           finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 40000, 'Synthesis');
