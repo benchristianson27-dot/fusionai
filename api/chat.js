@@ -1,62 +1,51 @@
 export const config = {
-  maxDuration: 90,
+  maxDuration: 60,
   api: { bodyParser: { sizeLimit: '10mb' } },
 };
 
 // ── Query Complexity Classification ──
-// Fast, zero-cost rule-based router that runs before any API calls.
-// Returns 'simple', 'medium', or 'complex'.
-
+// Loosened: more queries qualify as medium (2 models) instead of complex (4 models).
 function classifyQuery(prompt, history, fileData, mainMode) {
   const p = prompt.trim();
   const lower = p.toLowerCase();
   const wordCount = p.split(/\s+/).filter(Boolean).length;
   const hasFiles = fileData && fileData.length > 0;
 
-  // Force all 4 models for debate mode — that's the whole point
   if (mainMode === 'debate') return 'complex';
-
-  // If files are attached, always treat as complex
   if (hasFiles) return 'complex';
 
-  // ── SIMPLE: greetings, single-word, casual chat ──
-  // These should use ONE model and respond naturally
   const simplePatterns = [
     /^(hi|hey|hello|yo|sup|howdy|hola|what'?s up|whats up|good morning|good afternoon|good evening|good night|gm|gn|thanks|thank you|thx|ok|okay|cool|nice|lol|lmao|haha|wow|yep|yup|nope|nah|sure|bet|word|bruh|dude|bro|ayo|wassup|heyo)[\s!?.]*$/i,
     /^(how are you|how's it going|how are things|what's good|you there|are you there|test|testing|ping)[\s!?.]*$/i,
   ];
   if (simplePatterns.some(rx => rx.test(p))) return 'simple';
 
-  // Very short prompts (1-4 words) without complexity signals → simple
   if (wordCount <= 4) {
     const complexSignals = /compar|analyz|explain|research|detail|pros and cons|vs\.?|versus|differ|evaluat|review|assess|recommend|strateg|plan|build|create|develop|implement|design|architect|debug|refactor|optimize/i;
     if (!complexSignals.test(lower)) return 'simple';
   }
 
-  // ── MEDIUM: straightforward questions, definitions, quick tasks ──
-  // Use 2 models (fastest two) + synthesis for a balanced answer
-  if (wordCount <= 15) {
-    const complexIndicators = [
-      /compar.+(?:and|vs|versus|with)/i,
-      /pros?\s+(?:and\s+)?cons?/i,
-      /(?:in[- ]?depth|comprehensive|thorough|detailed)\s/i,
-      /step[- ]by[- ]step/i,
-      /(?:build|create|develop|implement|design|architect)\s+(?:a|an|the|my)/i,
-      /(?:write|draft|compose)\s+(?:a|an)\s+(?:essay|report|article|paper|proposal|plan|strategy)/i,
-      /(?:analyz|assess|evaluat|investigat|research)\s/i,
-      /(?:how\s+(?:should|would|can|do)\s+(?:i|we|you)\s+(?:build|create|design|implement|start|approach))/i,
-    ];
-    if (!complexIndicators.some(rx => rx.test(lower))) return 'medium';
+  // WIN #4: Medium cap raised from 15 to 25, and we're explicit about what's actually "complex"
+  // Only send to complex tier when we really need 4 models
+  const trulyComplexPatterns = [
+    /\b(compare|contrast)\b.{0,50}\b(and|vs|versus|with|to)\b/i,           // multi-item comparison
+    /\b(pros?\s+and\s+cons?|trade[- ]?offs?|advantages?\s+and\s+disadvantages?)\b/i,
+    /\b(in[- ]?depth|comprehensive|thorough|detailed|exhaustive|extensive)\s+(analysis|review|evaluation|breakdown|explanation|guide|report)/i,
+    /\b(analyze|evaluate|assess|investigate|research)\s+(the|this|my|our|their|these|those)/i,
+    /\b(write|draft|compose)\s+(an?\s+)?(essay|report|article|paper|proposal|dissertation|thesis|business plan|strategy|whitepaper)/i,
+    /\b(build|create|develop|implement|design|architect)\s+(a|an|the)\s+(complete|full|entire|comprehensive|production)/i,
+    /\b(debug|refactor|optimize|rewrite|review)\s+.{0,30}\b(code|function|class|system|architecture|app|application)/i,
+    /multiple perspectives|different viewpoints|various angles|many considerations/i,
+  ];
+
+  if (wordCount > 40 || trulyComplexPatterns.some(rx => rx.test(lower))) {
+    return 'complex';
   }
 
-  // ── COMPLEX: everything else ──
-  // Long prompts, multi-part questions, analysis requests, code generation, etc.
-  return 'complex';
+  return 'medium';
 }
 
-// Build a system prompt that matches the query complexity AND adapts to user's tone
 function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount, prompt) {
-  // Analyze the user's writing style from their prompt
   const toneHints = analyzeTone(prompt);
   let sys;
 
@@ -80,12 +69,10 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
   if (activeMode === 'thinking') sys += ' THINKING MODE: Show your reasoning step by step.';
   if (activeMode === 'search') sys += ' SEARCH MODE: Prioritize current information.';
 
-  // Creator context
   if (userEmail === 'ben.christianson27@gmail.com') {
     sys += ' CONTEXT: The user is Ben Christianson, creator of FusionAI. Be direct, treat him as a technical peer.';
   }
 
-  // Teacher easter egg
   if (userEmail === 'mmann@ndpsaints.org') {
     const count = parseInt(teacherPromptCount || '0');
     if (count > 0 && count % 15 === 0) {
@@ -96,26 +83,18 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
   return sys;
 }
 
-// Analyze user's writing style to determine appropriate response tone
 function analyzeTone(prompt) {
   const p = prompt.trim();
   const lower = p.toLowerCase();
   const words = p.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
 
-  // ── Detect if the prompt asks for PROFESSIONAL OUTPUT ──
-  // These are tasks where the OUTPUT must be professional regardless of how the user types.
-  // "write me an email", "draft a letter", "create a contract" → professional output needed
   const wantsProfessionalOutput = /\b(draft|write|compose|create|prepare)\b.{0,30}\b(email|letter|memo|report|contract|proposal|bio|resume|cover letter|invoice|quote|template|form|statement|newsletter|announcement|handbook|manual|policy|brief|pitch|press release|abstract|summary|review)\b/i.test(lower)
     || /\b(client|customer|patient|colleague|supervisor|manager|employer|attorney|doctor|staff|parent|investor|stakeholder)\b/i.test(lower)
     || /\b(professional|formal|business|corporate|official|legal|medical|clinical|academic|scientific)\b/i.test(lower);
 
-  // ── Detect professional/serious DOMAIN knowledge ──
-  // Topics where accuracy and clarity matter more than matching casual vibes
-  const professionalDomain = /\b(osha|nec|hipaa|compliance|regulation|deduction|tax|filing|diagnosis|sepsis|clinical|patient|liability|tort|statute|fiduciary|gaap|audit|amortiz|depreciat|nfpa|cfr|code\s+section|mediation|litigation|custody|divorce|asylum|refugee|immigration|dispensary|cannabis|pharmaceutical|prescription|surgery|veterinar|embalm|funeral|mortgage|underwriting|fiduciary|escrow|appraisal|scaffold|incident\s+report|intake\s+form|grant\s+title|species\s+distribution|coral\s+reef|microplastic)\b/i.test(lower);
+  const professionalDomain = /\b(osha|nec|hipaa|compliance|regulation|deduction|tax|filing|diagnosis|sepsis|clinical|patient|liability|tort|statute|fiduciary|gaap|audit|amortiz|depreciat|nfpa|cfr|code\s+section|mediation|litigation|custody|divorce|asylum|refugee|immigration|dispensary|cannabis|pharmaceutical|prescription|surgery|veterinar|embalm|funeral|mortgage|underwriting|escrow|appraisal|scaffold|incident\s+report|intake\s+form|grant\s+title|species\s+distribution|coral\s+reef|microplastic)\b/i.test(lower);
 
-  // ── Detect STRONG casual signals ──
-  // Only count genuinely casual markers (not just lowercase/no punctuation)
   const strongCasualSignals = [
     /\bu\b(?!\.\s*s)/i, /\bur\b/i, /\bpls\b/i, /\bthx\b/i, /\btbh\b/i,
     /\blol\b/i, /\blmao\b/i, /\bidk\b/i, /\bomg\b/i, /\bbtw\b/i,
@@ -126,79 +105,41 @@ function analyzeTone(prompt) {
   ];
   const casualCount = strongCasualSignals.filter(rx => rx.test(p)).length;
 
-  // Detect technical writing
   const techSignals = /\b(api|sql|css|html|react|python|node|docker|kubernetes|regex|oauth|jwt|graphql|typescript|webpack|nginx|redis|postgres|mongodb|cicd|devops|github|npm|pip|async|await|function|const|let|var|useState|useEffect|component|endpoint|middleware|backend|frontend|deploy|repository|commit|merge|branch)\b/i;
   const isTechnical = techSignals.test(lower);
 
-  // Detect if they want something quick vs detailed
   const wantsQuick = /\b(quick|fast|brief|short|simple|easy|just|basic)\b/i.test(lower);
   const wantsDetailed = /\b(detailed|comprehensive|thorough|in[- ]depth|complete|full|extensive|everything)\b/i.test(lower);
 
-  // ── Decide tone tier ──
-  // The key insight: default to PROFESSIONAL. Only go casual if there are
-  // strong casual signals AND the content isn't professional in nature.
   let toneTier;
-
-  if (wantsProfessionalOutput || professionalDomain) {
-    // Professional output requested or professional domain → always professional tone
-    // Even if they type "yo write me an email to my client" → the EMAIL should be professional
-    toneTier = 'professional';
-  } else if (isTechnical) {
-    toneTier = 'technical';
-  } else if (casualCount >= 2) {
-    // Multiple strong casual signals + no professional context → casual is OK
-    toneTier = 'casual';
-  } else if (casualCount === 1 && wordCount <= 12) {
-    // One casual signal in a short message → casual
-    toneTier = 'casual';
-  } else {
-    // Default: friendly but clear. This is the safe middle ground.
-    toneTier = 'balanced';
-  }
+  if (wantsProfessionalOutput || professionalDomain) toneTier = 'professional';
+  else if (isTechnical) toneTier = 'technical';
+  else if (casualCount >= 2) toneTier = 'casual';
+  else if (casualCount === 1 && wordCount <= 12) toneTier = 'casual';
+  else toneTier = 'balanced';
 
   let instructions = '';
-
   if (toneTier === 'casual') {
-    instructions += 'TONE: The user writes very casually. Use simple, conversational language. '
-      + 'Keep sentences short. Skip markdown headers unless the response is very long. '
-      + 'Talk like a knowledgeable friend, not a professor. '
-      + 'But stay CLEAR and ACCURATE — casual tone does not mean vague answers. ';
+    instructions += 'TONE: The user writes very casually. Use simple, conversational language. Keep sentences short. Skip markdown headers unless the response is very long. Talk like a knowledgeable friend, not a professor. But stay CLEAR and ACCURATE — casual tone does not mean vague answers. ';
   } else if (toneTier === 'technical') {
-    instructions += 'TONE: The user is technical. Be precise and use proper terminology. '
-      + 'Include code examples or specific technical details where relevant. '
-      + 'Use ## headers for organization. ';
+    instructions += 'TONE: The user is technical. Be precise and use proper terminology. Include code examples or specific technical details where relevant. Use ## headers for organization. ';
   } else if (toneTier === 'professional') {
-    instructions += 'TONE: This requires professional-quality output. Write clearly and formally. '
-      + 'Use proper terminology for the domain. Do NOT use slang, casual language, or informal phrasing. '
-      + 'Treat the user as a professional peer. Structure the response well. '
-      + 'If drafting content for the user (emails, letters, reports), make it ready to use as-is. ';
+    instructions += 'TONE: This requires professional-quality output. Write clearly and formally. Use proper terminology for the domain. Do NOT use slang, casual language, or informal phrasing. Treat the user as a professional peer. Structure the response well. If drafting content for the user (emails, letters, reports), make it ready to use as-is. ';
   } else {
-    // balanced
-    instructions += 'TONE: Write in a friendly, clear, approachable way. '
-      + 'Be helpful without being overly formal or overly casual. '
-      + 'Only use ## headers if the response needs multiple distinct sections. ';
+    instructions += 'TONE: Write in a friendly, clear, approachable way. Be helpful without being overly formal or overly casual. Only use ## headers if the response needs multiple distinct sections. ';
   }
 
-  // Length matching
   if (wantsQuick) {
-    instructions += 'LENGTH: The user wants a quick answer. Be concise — get to the point fast. '
-      + 'Skip the preamble. Only add follow-up questions if truly relevant. ';
+    instructions += 'LENGTH: The user wants a quick answer. Be concise — get to the point fast. Skip the preamble. Only add follow-up questions if truly relevant. ';
   } else if (wantsDetailed) {
-    instructions += 'LENGTH: The user wants depth. Give a thorough answer with examples. '
-      + 'End with 2-3 follow-up questions. ';
+    instructions += 'LENGTH: The user wants depth. Give a thorough answer with examples. End with 2-3 follow-up questions. ';
   } else if (wordCount <= 10) {
-    instructions += 'LENGTH: Short question = proportional answer. Don\'t over-elaborate. '
-      + 'Only ask 1 follow-up question if it adds value. ';
+    instructions += 'LENGTH: Short question = proportional answer. Don\'t over-elaborate. Only ask 1 follow-up question if it adds value. ';
   } else {
-    instructions += 'LENGTH: Match your response length to the complexity of the question. '
-      + 'End with 1-2 follow-up questions if relevant. ';
+    instructions += 'LENGTH: Match your response length to the complexity of the question. End with 1-2 follow-up questions if relevant. ';
   }
 
-  // Formatting rules (apply to all tiers)
-  instructions += 'FORMAT: Write in paragraphs by default, NOT bullet points. '
-    + 'Bullet points should be rare — only for short lists of proper nouns or sequential steps. '
-    + 'When comparing things, showing data, or presenting structured info, use MARKDOWN TABLES. '
-    + 'Tables are better than bullet lists for comparisons, pricing, schedules, pros/cons, and any multi-column data. ';
+  instructions += 'FORMAT: Write in paragraphs by default, NOT bullet points. Bullet points should be rare — only for short lists of proper nouns or sequential steps. When comparing things, showing data, or presenting structured info, use MARKDOWN TABLES. Tables are better than bullet lists for comparisons, pricing, schedules, pros/cons, and any multi-column data. ';
 
   return { instructions, toneTier, isTechnical, wantsQuick };
 }
@@ -211,7 +152,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { prompt, history, tier: clientTier, mode, fileData, mainMode, userEmail, teacherPromptCount } = req.body;
+  const { prompt, history, tier: clientTier, mode, fileData, mainMode, userEmail, teacherPromptCount, stream: wantsStream } = req.body;
   const tier = clientTier || 'free';
   if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
 
@@ -221,6 +162,9 @@ export default async function handler(req, res) {
     gemini: process.env.GEMINI_API_KEY,
     grok: process.env.GROK_API_KEY,
   };
+
+  // WIN #2: Haiku is always used for synthesis regardless of tier (fast + smart enough)
+  const SYNTH_MODEL = 'claude-haiku-4-5-20251001';
 
   const TIER_MODELS = {
     free: { claude: 'claude-haiku-4-5-20251001', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash', grok: 'grok-3-mini' },
@@ -233,11 +177,9 @@ export default async function handler(req, res) {
   const activeMode = mode || 'normal';
   const convHistory = Array.isArray(history) ? history.slice(-10) : [];
 
-  // ── Smart Query Classification ──
   const complexity = classifyQuery(prompt, convHistory, fileData, mainMode);
   const systemPrompt = buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount, prompt);
 
-  // ── Extract image data from fileData ──
   const images = (fileData || []).filter(f => f.type === 'image' && f.imageBase64);
   const textFiles = (fileData || []).filter(f => f.type !== 'image');
   const hasImages = images.length > 0;
@@ -247,7 +189,11 @@ export default async function handler(req, res) {
     fullPrompt = textFiles.map(f => '[File: ' + f.name + ']\n' + f.content).join('\n\n') + '\n\nUser request: ' + prompt;
   }
 
-  // ── Timeout helper ──
+  // WIN #5: max_tokens dropped from 3000 to 1500 for individual calls
+  // Synthesis gets 2000 (slightly more room since it's the final answer)
+  const INDIVIDUAL_MAX_TOKENS = 1500;
+  const SYNTHESIS_MAX_TOKENS = 2000;
+
   function withTimeout(promise, ms, name) {
     return Promise.race([
       promise,
@@ -255,22 +201,17 @@ export default async function handler(req, res) {
     ]);
   }
 
-  // ── Build vision-aware user message content per API format ──
-
-  // Claude format: array of content blocks
+  // ── Vision content builders (unchanged) ──
   function buildClaudeContent(text) {
     const parts = [];
     images.forEach(img => {
       const mime = img.imageMime || 'image/png';
-      // Claude accepts: image/jpeg, image/png, image/gif, image/webp
       const safeMime = ['image/jpeg','image/png','image/gif','image/webp'].includes(mime) ? mime : 'image/png';
       parts.push({ type: 'image', source: { type: 'base64', media_type: safeMime, data: img.imageBase64 } });
     });
     parts.push({ type: 'text', text: text });
     return parts;
   }
-
-  // OpenAI / Grok format: array with image_url and text
   function buildOpenAIContent(text) {
     const parts = [];
     images.forEach(img => {
@@ -280,8 +221,6 @@ export default async function handler(req, res) {
     parts.push({ type: 'text', text: text });
     return parts;
   }
-
-  // Gemini format: array of parts with inline_data
   function buildGeminiParts(text) {
     const parts = [];
     images.forEach(img => {
@@ -292,12 +231,12 @@ export default async function handler(req, res) {
     return parts;
   }
 
-  // ── API Callers (vision-aware) ──
+  // ── Non-streaming callers (for the initial four queries) ──
   async function callClaude(p, model, hist, key, sys) {
     if (!key) throw new Error('No key');
     const userContent = hasImages ? buildClaudeContent(p) : p;
     const messages = hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: userContent }]);
-    const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: 3000, system: sys, messages }) });
+    const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: INDIVIDUAL_MAX_TOKENS, system: sys, messages }) });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Claude error ' + r.status); }
     return (await r.json()).content?.[0]?.text || '';
   }
@@ -306,7 +245,7 @@ export default async function handler(req, res) {
     if (!key) throw new Error('No key');
     const userContent = hasImages ? buildOpenAIContent(p) : p;
     const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
-    const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages }) });
+    const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: INDIVIDUAL_MAX_TOKENS, messages }) });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI error ' + r.status); }
     return (await r.json()).choices?.[0]?.message?.content || '';
   }
@@ -314,7 +253,7 @@ export default async function handler(req, res) {
   async function callGemini(p, model, hist, key, sys) {
     if (!key) throw new Error('No key');
     const parts = hasImages ? buildGeminiParts(sys + '\n\n' + p) : [{ text: sys + '\n\n' + p }];
-    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { maxOutputTokens: 3000 } }) });
+    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { maxOutputTokens: INDIVIDUAL_MAX_TOKENS } }) });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Gemini error ' + r.status); }
     return (await r.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
   }
@@ -323,160 +262,421 @@ export default async function handler(req, res) {
     if (!key) throw new Error('No key');
     const userContent = hasImages ? buildOpenAIContent(p) : p;
     const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
-    const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages }) });
-    if (r.ok) return (await r.json()).choices?.[0]?.message?.content || '';
-    if (r.status >= 500) {
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      const r2 = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: 3000, messages }) });
-      if (!r2.ok) throw new Error('Grok error ' + r2.status);
-      return (await r2.json()).choices?.[0]?.message?.content || '';
+    // No retry — if Grok 5xx's, let it fail fast rather than blocking 2 extra seconds
+    const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: INDIVIDUAL_MAX_TOKENS, messages }) });
+    if (!r.ok) throw new Error('Grok error ' + r.status);
+    return (await r.json()).choices?.[0]?.message?.content || '';
+  }
+
+  // ── Streaming Claude caller for synthesis ──
+  // Yields incremental text deltas via async iterator.
+  async function* streamClaude(p, model, hist, key, sys, maxTokens) {
+    if (!key) throw new Error('No key');
+    const userContent = hasImages ? buildClaudeContent(p) : p;
+    const messages = hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: userContent }]);
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model, max_tokens: maxTokens, system: sys, messages, stream: true })
+    });
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Claude stream error ' + r.status); }
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (!data || data === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'text_delta') {
+              yield parsed.delta.text;
+            }
+          } catch { /* skip malformed chunks */ }
+        }
+      }
+    } finally {
+      reader.releaseLock();
     }
-    throw new Error('Grok error ' + r.status);
+  }
+
+  // ── SSE helpers ──
+  function setupSSE() {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering if present
+    res.flushHeaders?.();
+  }
+
+  function sendEvent(type, data) {
+    res.write('data: ' + JSON.stringify({ type, ...data }) + '\n\n');
+  }
+
+  // ── Build synthesis instruction (shared between medium and complex) ──
+  function buildSynthInstruction(successfulCount) {
+    const toneHints = analyzeTone(prompt);
+    const base = 'You are the FusionAI synthesis engine. Create one SUPERIOR answer from these AI responses. '
+      + 'CRITICAL RULES: '
+      + '1) NEVER mention models, synthesis, or that multiple AIs were used. '
+      + '2) MIRROR THE USER\'S TONE AND STYLE. Read the user\'s message carefully — if casual (lowercase, slang), respond conversationally. If professional, match that formality. '
+      + '3) Be SPECIFIC — use real names, numbers, concrete examples relevant to the user\'s context. '
+      + '4) Use ## headers ONLY for long responses (4+ distinct sections). For shorter answers, just use paragraphs. '
+      + '5) FORMATTING: Write in PARAGRAPHS as the default. Do NOT use bullet points unless listing 3-5 short proper nouns or sequential steps. '
+      + 'When presenting comparisons, options, data, numbers, schedules, or structured information, use MARKDOWN TABLES instead of bullet lists. '
+      + 'If the topic involves numbers, percentages, prices, or metrics, ALWAYS present them in a table. '
+      + '6) Include concrete, specific examples — not generic advice. '
+      + '7) Follow-up questions: ask 1-2 only if they genuinely help. For straightforward requests, skip them. '
+      + (toneHints.toneTier === 'casual' ? '8) This user is very casual — keep it conversational, skip headers. ' : '')
+      + (toneHints.toneTier === 'professional' ? '8) This requires PROFESSIONAL output — formal language, proper terminology, no slang. ' : '')
+      + (toneHints.wantsQuick ? '9) The user wants a QUICK answer — be concise. ' : '')
+      + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
+    return base;
   }
 
   try {
+    // ── Setup SSE if streaming requested, otherwise fall back to JSON ──
+    if (wantsStream) setupSSE();
+
     let successful = [];
     let failed = [];
     let synthesized = false;
     let finalReply = '';
 
-    // ── Route based on complexity ──
+    // ── Helper: collect results as they complete ──
+    // Returns a promise that resolves to { successful, failed } when all are done,
+    // AND also emits events as each model responds (when streaming).
+    function collectResults(promises, names) {
+      const results = { successful: [], failed: [] };
+      const wrapped = promises.map((p, i) =>
+        p.then(
+          value => {
+            if (value) {
+              results.successful.push({ name: names[i], text: value });
+              if (wantsStream) sendEvent('model_done', { model: names[i] });
+            } else {
+              results.failed.push({ name: names[i], error: 'Empty response' });
+              if (wantsStream) sendEvent('model_failed', { model: names[i], error: 'Empty' });
+            }
+          },
+          err => {
+            results.failed.push({ name: names[i], error: err?.message || 'Unknown' });
+            if (wantsStream) sendEvent('model_failed', { model: names[i], error: err?.message || 'Unknown' });
+          }
+        )
+      );
+      return { allDone: Promise.all(wrapped), results };
+    }
 
+    // ── SIMPLE: single model, stream directly ──
     if (complexity === 'simple') {
-      // SIMPLE: Use only Claude (fastest, cheapest for the tier).
-      // No synthesis needed — just a direct, natural response.
-      try {
-        finalReply = await withTimeout(
-          callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt),
-          30000, 'Claude'
-        );
-        successful = [{ name: 'Claude', text: finalReply }];
-      } catch (e) {
-        // Fallback to Gemini if Claude fails
+      if (wantsStream) {
+        sendEvent('complexity', { complexity, models: ['Claude'] });
         try {
-          finalReply = await withTimeout(
-            callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt),
-            30000, 'Gemini'
-          );
-          successful = [{ name: 'Gemini', text: finalReply }];
-        } catch (e2) {
-          return res.status(500).json({ error: 'All models failed', failed: [{ name: 'Claude', error: e.message }, { name: 'Gemini', error: e2.message }] });
+          let acc = '';
+          for await (const delta of streamClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS)) {
+            acc += delta;
+            sendEvent('delta', { text: delta });
+          }
+          sendEvent('done', { reply: acc, synthesized: false, models: ['Claude'], failed: [], complexity });
+          res.end();
+          return;
+        } catch (e) {
+          try {
+            let acc = '';
+            for await (const delta of (async function* () {
+              // Fallback: non-streaming Gemini, simulated as a single chunk
+              const text = await callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt);
+              yield text;
+            })()) {
+              acc += delta;
+              sendEvent('delta', { text: delta });
+            }
+            sendEvent('done', { reply: acc, synthesized: false, models: ['Gemini'], failed: [{ name: 'Claude', error: e.message }], complexity });
+            res.end();
+            return;
+          } catch (e2) {
+            sendEvent('error', { error: 'All models failed', details: [e.message, e2.message] });
+            res.end();
+            return;
+          }
         }
+      } else {
+        // Non-streaming fallback
+        try {
+          finalReply = await withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
+          successful = [{ name: 'Claude', text: finalReply }];
+        } catch (e) {
+          try {
+            finalReply = await withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
+            successful = [{ name: 'Gemini', text: finalReply }];
+          } catch (e2) {
+            return res.status(500).json({ error: 'All models failed' });
+          }
+        }
+        return res.status(200).json({ reply: finalReply, synthesized: false, models: successful.map(s => s.name), failed: [], individual: successful, mode: activeMode, complexity });
       }
+    }
 
-    } else if (complexity === 'medium') {
-      // MEDIUM: Use 2 models (Claude + Gemini — fastest pair), synthesize.
-      const results = await Promise.allSettled([
-        withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 40000, 'Claude'),
-        withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 40000, 'Gemini'),
-      ]);
+    // ── MEDIUM: 2 models (Claude + Gemini), synthesize via streaming ──
+    if (complexity === 'medium') {
+      if (wantsStream) sendEvent('complexity', { complexity, models: ['Claude', 'Gemini'] });
 
-      const names = ['Claude', 'Gemini'];
-      results.forEach((r, i) => {
-        if (r.status === 'fulfilled' && r.value) {
-          successful.push({ name: names[i], text: r.value });
-        } else {
-          failed.push({ name: names[i], error: r.reason ? r.reason.message : 'No response' });
-        }
-      });
+      // WIN #3: tighter timeouts (25s cap)
+      const claudeP = withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
+      const geminiP = withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
 
-      // Tell the frontend the other two were skipped, not failed
+      const { allDone, results } = collectResults([claudeP, geminiP], ['Claude', 'Gemini']);
+
+      // WIN #6: If Claude returns quickly (<4s) with a solid answer, don't wait for Gemini
+      // Start a race: claudeP resolves fast → we can short-circuit.
+      // But easiest correct impl: wait for both (they run parallel), skip synthesis if only 1 back.
+      await allDone;
+
+      successful = results.successful;
+      failed = results.failed;
+
       const skipped = [
         { name: 'ChatGPT', error: 'Skipped (quick query)' },
         { name: 'Grok', error: 'Skipped (quick query)' },
       ];
 
       if (successful.length === 0) {
+        if (wantsStream) {
+          sendEvent('error', { error: 'All models failed', failed: failed.concat(skipped) });
+          res.end();
+          return;
+        }
         return res.status(500).json({ error: 'All models failed', failed: failed.concat(skipped), failedDetails: failed.concat(skipped) });
       }
 
+      // WIN #6: If only one succeeded, just stream its text directly (skip synthesis)
       if (successful.length === 1) {
-        finalReply = successful[0].text;
-      } else {
-        synthesized = true;
-        const synthPrompt = 'The user asked: "' + prompt + '"\n\nHere are responses from 2 AI models:\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
-        const toneHints = analyzeTone(prompt);
-        const synthInst = 'You are the FusionAI synthesis engine. Combine these responses into one clean answer. '
-          + 'CRITICAL RULES: 1) NEVER mention models, synthesis, or that multiple AIs were used. '
-          + '2) MIRROR THE USER\'S TONE. If they write casually (lowercase, slang, short sentences), respond the same way. '
-          + 'If they write formally, match that. Read their message carefully and write like you\'re talking to THEM specifically. '
-          + '3) Keep the response proportional to the question — short question = concise answer. '
-          + '4) Use concrete examples relevant to the user\'s apparent context. '
-          + '5) Only ask a follow-up question if it genuinely helps them. Skip it for simple questions. '
-          + '6) FORMATTING: Write in PARAGRAPHS, not bullet points. Bullet points should be rare — only for short lists of 3-5 proper nouns or steps. '
-          + 'Use markdown TABLES when comparing items, showing data, or presenting options side-by-side. '
-          + 'Tables are almost always better than bullet lists for structured information. '
-          + (toneHints.toneTier === 'casual' ? '7) This user is very casual — NO headers, NO formal structure, keep it conversational. ' : '')
-          + (toneHints.toneTier === 'professional' ? '7) This requires PROFESSIONAL output — formal language, no slang, treat user as a peer. ' : '')
-          + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
+        const text = successful[0].text;
+        if (wantsStream) {
+          sendEvent('synth_start', {});
+          // Stream the single response out as chunks to preserve the streaming UX
+          const chunkSize = 40;
+          for (let i = 0; i < text.length; i += chunkSize) {
+            sendEvent('delta', { text: text.slice(i, i + chunkSize) });
+          }
+          sendEvent('done', {
+            reply: text,
+            synthesized: false,
+            models: successful.map(s => s.name),
+            failed: failed.concat(skipped).map(f => f.name),
+            failedDetails: failed.concat(skipped),
+            complexity
+          });
+          res.end();
+          return;
+        }
+        return res.status(200).json({ reply: text, synthesized: false, models: successful.map(s => s.name), failed: failed.concat(skipped).map(f => f.name), failedDetails: failed.concat(skipped), individual: successful, mode: activeMode, complexity });
+      }
+
+      // Both succeeded → synthesize
+      const synthPrompt = 'The user asked: "' + prompt + '"\n\nHere are responses from 2 AI models:\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
+      const synthInst = buildSynthInstruction(successful.length);
+
+      if (wantsStream) {
+        sendEvent('synth_start', {});
         try {
-          finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 30000, 'Synthesis');
+          let acc = '';
+          for await (const delta of streamClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, SYNTHESIS_MAX_TOKENS)) {
+            acc += delta;
+            sendEvent('delta', { text: delta });
+          }
+          sendEvent('done', {
+            reply: acc,
+            synthesized: true,
+            models: successful.map(s => s.name),
+            failed: failed.concat(skipped).map(f => f.name),
+            failedDetails: failed.concat(skipped),
+            complexity
+          });
+          res.end();
+          return;
         } catch (e) {
-          finalReply = successful[0].text;
-          synthesized = false;
+          // Fallback to first successful if synthesis stream fails
+          const fallback = successful[0].text;
+          sendEvent('delta', { text: fallback });
+          sendEvent('done', {
+            reply: fallback,
+            synthesized: false,
+            models: successful.map(s => s.name),
+            failed: failed.concat(skipped).map(f => f.name),
+            failedDetails: failed.concat(skipped),
+            complexity
+          });
+          res.end();
+          return;
         }
       }
 
-      failed = failed.concat(skipped);
-
-    } else {
-      // COMPLEX: Full 4-model query + synthesis (the original FusionAI experience)
-      const results = await Promise.allSettled([
-        withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 50000, 'Claude'),
-        withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 50000, 'ChatGPT'),
-        withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 50000, 'Gemini'),
-        withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 50000, 'Grok'),
-      ]);
-
-      const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
-      results.forEach((r, i) => {
-        if (r.status === 'fulfilled' && r.value) {
-          successful.push({ name: names[i], text: r.value });
-        } else {
-          failed.push({ name: names[i], error: r.reason ? r.reason.message : 'No response' });
-        }
+      // Non-streaming fallback for medium
+      try {
+        finalReply = await withTimeout(callClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 20000, 'Synthesis');
+        synthesized = true;
+      } catch {
+        finalReply = successful[0].text;
+      }
+      return res.status(200).json({
+        reply: finalReply,
+        synthesized,
+        models: successful.map(s => s.name),
+        failed: failed.concat(skipped).map(f => f.name),
+        failedDetails: failed.concat(skipped),
+        individual: successful,
+        mode: activeMode,
+        complexity
       });
+    }
 
-      if (successful.length === 0) {
-        return res.status(500).json({ error: 'All models failed', failed, failedDetails: failed });
-      }
+    // ── COMPLEX: 4 models with race logic (start synthesis when 3/4 in) ──
+    if (wantsStream) sendEvent('complexity', { complexity, models: ['Claude', 'ChatGPT', 'Gemini', 'Grok'] });
 
-      if (successful.length === 1) {
-        finalReply = successful[0].text;
-      } else {
-        synthesized = true;
-        const synthPrompt = 'The user asked: "' + prompt + '"\n\nHere are responses from ' + successful.length + ' AI models:\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
-        const toneHints = analyzeTone(prompt);
-        const synthInst = 'You are the FusionAI synthesis engine. Create one SUPERIOR answer from these AI responses. '
-          + 'CRITICAL RULES: '
-          + '1) NEVER mention models, synthesis, or that multiple AIs were used. '
-          + '2) MIRROR THE USER\'S TONE AND STYLE. This is the most important rule. '
-          + 'Read the user\'s message carefully — if they use casual language (lowercase, abbreviations, slang), '
-          + 'respond conversationally like a knowledgeable friend. If they write professionally, match that formality. '
-          + 'If they seem like a non-expert, avoid jargon or explain any technical terms you use. '
-          + 'If they seem technical, use precise terminology. '
-          + '3) Be SPECIFIC — use real names, numbers, concrete examples relevant to the user\'s context. '
-          + '4) Use ## headers ONLY for long responses (4+ distinct sections). For shorter answers, just use paragraphs. '
-          + '5) FORMATTING IS CRITICAL: Write in PARAGRAPHS as the default. Do NOT use bullet points unless listing 3-5 short proper nouns or sequential steps. '
-          + 'When presenting comparisons, options, data, numbers, schedules, or any structured information, use MARKDOWN TABLES instead of bullet lists. '
-          + 'Tables are cleaner and more professional than bullets for any side-by-side or multi-column information. '
-          + 'If the topic involves numbers, percentages, prices, or metrics, ALWAYS present them in a table. '
-          + '6) Include concrete, specific examples — not generic advice. If they mention a bakery, use bakery examples. '
-          + 'If they mention construction, use construction examples. '
-          + '7) Follow-up questions: ask 1-2 only if they genuinely help. For straightforward requests, skip them. '
-          + 'Never ask follow-up questions that just restate what the user already told you. '
-          + (toneHints.toneTier === 'casual' ? '8) This user is very casual — keep it conversational, skip headers and formal structure. ' : '')
-          + (toneHints.toneTier === 'professional' ? '8) This requires PROFESSIONAL output — use formal language, proper domain terminology, no slang. Treat user as a professional peer. ' : '')
-          + (toneHints.wantsQuick ? '9) The user wants a QUICK answer — be concise. ' : '')
-          + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
+    // WIN #3: Grok gets tighter timeout because it's typically the slowest
+    const claudeP = withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
+    const gptP = withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 25000, 'ChatGPT');
+    const geminiP = withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
+    const grokP = withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 20000, 'Grok');
 
-        try {
-          finalReply = await withTimeout(callClaude(synthPrompt, models.claude, [], KEYS.anthropic, synthInst), 40000, 'Synthesis');
-        } catch (e) {
-          finalReply = successful[0].text;
-          synthesized = false;
+    // Track each result as it arrives
+    const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
+    const promises = [claudeP, gptP, geminiP, grokP];
+
+    // Manually collect with event emission as they land (true streaming of progress)
+    const collected = [];
+    const settledFlags = [false, false, false, false];
+
+    const wrapped = promises.map((p, i) =>
+      p.then(
+        value => {
+          settledFlags[i] = true;
+          if (value) {
+            collected.push({ name: names[i], text: value, ok: true });
+            if (wantsStream) sendEvent('model_done', { model: names[i] });
+          } else {
+            collected.push({ name: names[i], text: null, ok: false, error: 'Empty' });
+            if (wantsStream) sendEvent('model_failed', { model: names[i], error: 'Empty' });
+          }
+        },
+        err => {
+          settledFlags[i] = true;
+          collected.push({ name: names[i], text: null, ok: false, error: err?.message || 'Unknown' });
+          if (wantsStream) sendEvent('model_failed', { model: names[i], error: err?.message || 'Unknown' });
         }
+      )
+    );
+
+    // WIN #3 (race): resolve when we have 3 successes OR all 4 settled, whichever first
+    // Wait max 15s for 3rd response after first response came in
+    let firstResponseTime = null;
+    function successCount() { return collected.filter(c => c.ok).length; }
+    function allDone() { return settledFlags.every(f => f); }
+
+    const startTime = Date.now();
+    const MAX_WAIT_AFTER_3 = 4000; // ms to wait for 4th after 3 are in
+
+    await new Promise(resolve => {
+      let resolved = false;
+      let raceTimer = null;
+      function done() {
+        if (resolved) return;
+        resolved = true;
+        if (raceTimer) clearTimeout(raceTimer);
+        resolve();
       }
+      // Check every 150ms whether we should proceed
+      const checker = setInterval(() => {
+        if (allDone()) { clearInterval(checker); done(); return; }
+        if (successCount() >= 3 && !raceTimer) {
+          // Start 4-second grace period for Grok/stragglers
+          raceTimer = setTimeout(() => { clearInterval(checker); done(); }, MAX_WAIT_AFTER_3);
+        }
+        // Hard ceiling at 25s total (timeouts should have fired, but belt-and-suspenders)
+        if (Date.now() - startTime > 26000) { clearInterval(checker); done(); }
+      }, 150);
+      // Also resolve naturally when all complete
+      Promise.all(wrapped).then(() => { clearInterval(checker); done(); });
+    });
+
+    successful = collected.filter(c => c.ok).map(c => ({ name: c.name, text: c.text }));
+    failed = collected.filter(c => !c.ok).map(c => ({ name: c.name, error: c.error }));
+
+    // Fill in "not yet responded" for any model that didn't settle in time
+    names.forEach((n, i) => {
+      if (!settledFlags[i] && !successful.find(s => s.name === n) && !failed.find(f => f.name === n)) {
+        failed.push({ name: n, error: 'Response skipped (answering from faster models)' });
+      }
+    });
+
+    if (successful.length === 0) {
+      if (wantsStream) {
+        sendEvent('error', { error: 'All models failed', failed });
+        res.end();
+        return;
+      }
+      return res.status(500).json({ error: 'All models failed', failed, failedDetails: failed });
+    }
+
+    // If only one model succeeded, stream it directly (no synthesis needed)
+    if (successful.length === 1) {
+      const text = successful[0].text;
+      if (wantsStream) {
+        sendEvent('synth_start', {});
+        const chunkSize = 40;
+        for (let i = 0; i < text.length; i += chunkSize) {
+          sendEvent('delta', { text: text.slice(i, i + chunkSize) });
+        }
+        sendEvent('done', { reply: text, synthesized: false, models: [successful[0].name], failed: failed.map(f => f.name), failedDetails: failed, complexity });
+        res.end();
+        return;
+      }
+      return res.status(200).json({ reply: text, synthesized: false, models: [successful[0].name], failed: failed.map(f => f.name), failedDetails: failed, individual: successful, mode: activeMode, complexity });
+    }
+
+    // Synthesize from whoever responded (could be 2, 3, or 4)
+    const synthPrompt = 'The user asked: "' + prompt + '"\n\nHere are responses from ' + successful.length + ' AI models:\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
+    const synthInst = buildSynthInstruction(successful.length);
+
+    if (wantsStream) {
+      sendEvent('synth_start', {});
+      try {
+        let acc = '';
+        // WIN #2: synthesis uses Haiku regardless of tier
+        // WIN #1: synthesis is streamed
+        for await (const delta of streamClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, SYNTHESIS_MAX_TOKENS)) {
+          acc += delta;
+          sendEvent('delta', { text: delta });
+        }
+        sendEvent('done', { reply: acc, synthesized: true, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity });
+        res.end();
+        return;
+      } catch (e) {
+        const fallback = successful[0].text;
+        sendEvent('delta', { text: fallback });
+        sendEvent('done', { reply: fallback, synthesized: false, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity });
+        res.end();
+        return;
+      }
+    }
+
+    // Non-streaming fallback for complex
+    try {
+      finalReply = await withTimeout(callClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 25000, 'Synthesis');
+      synthesized = true;
+    } catch {
+      finalReply = successful[0].text;
     }
 
     return res.status(200).json({
@@ -487,11 +687,15 @@ export default async function handler(req, res) {
       failedDetails: failed,
       individual: successful,
       mode: activeMode,
-      complexity,
+      complexity
     });
 
   } catch (e) {
     console.error('Handler error:', e);
-    return res.status(500).json({ error: e.message });
+    if (wantsStream && !res.writableEnded) {
+      try { sendEvent('error', { error: e.message }); res.end(); } catch {}
+      return;
+    }
+    if (!res.headersSent) return res.status(500).json({ error: e.message });
   }
 }
