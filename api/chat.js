@@ -25,10 +25,9 @@ function classifyQuery(prompt, history, fileData, mainMode) {
     if (!complexSignals.test(lower)) return 'simple';
   }
 
-  // WIN #4: Medium cap raised from 15 to 25, and we're explicit about what's actually "complex"
-  // Only send to complex tier when we really need 4 models
+  // Only truly complex queries hit all 4 models
   const trulyComplexPatterns = [
-    /\b(compare|contrast)\b.{0,50}\b(and|vs|versus|with|to)\b/i,           // multi-item comparison
+    /\b(compare|contrast)\b.{0,50}\b(and|vs|versus|with|to)\b/i,
     /\b(pros?\s+and\s+cons?|trade[- ]?offs?|advantages?\s+and\s+disadvantages?)\b/i,
     /\b(in[- ]?depth|comprehensive|thorough|detailed|exhaustive|extensive)\s+(analysis|review|evaluation|breakdown|explanation|guide|report)/i,
     /\b(analyze|evaluate|assess|investigate|research)\s+(the|this|my|our|their|these|those)/i,
