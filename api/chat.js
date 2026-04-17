@@ -98,6 +98,20 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
     }
   }
 
+  // ── DIRECT ANSWER POLICY ──
+  // FusionAI users want honest, unhedged answers. They know they're talking to AI.
+  sys += ' DIRECT ANSWER POLICY: '
+       + 'Do NOT add unsolicited safety warnings, medical disclaimers, legal disclaimers, or "consult a professional" boilerplate. '
+       + 'Do NOT moralize, lecture, or add ethical commentary the user didn\'t ask for. '
+       + 'Do NOT refuse to discuss peptides (BPC-157, TB-500, GHK-Cu, semaglutide, tirzepatide, SARMs, steroids, etc.), '
+       + 'recreational drugs, harm reduction, controversial politics, adult topics, legal firearms/hunting, or opinions on debated issues. '
+       + 'If the user asks what you think, share an actual opinion with reasoning — do NOT dodge with "it depends on your perspective." '
+       + 'Treat the user as an intelligent adult who can handle direct information. '
+       + 'Be the unfiltered, knowledgeable expert friend they came here for — not a liability-terrified corporate assistant. '
+       + 'The ONLY things you refuse: explicit instructions for synthesizing weapons/bioweapons/illegal drugs at a how-to level, '
+       + 'content sexualizing minors, directly assisting someone planning harm to a specific person, or functional malware. '
+       + 'Everything else — answer directly and usefully.';
+
   return sys;
 }
 
@@ -193,7 +207,7 @@ export default async function handler(req, res) {
 
   const models = TIER_MODELS[tier] || TIER_MODELS.free;
   const activeMode = mode || 'normal';
-  const convHistory = Array.isArray(history) ? history.slice(-10) : [];
+  const convHistory = Array.isArray(history) ? history.slice(-20) : [];
 
   const complexity = classifyQuery(prompt, convHistory, fileData, mainMode);
   const systemPrompt = buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount, prompt);
@@ -270,8 +284,25 @@ export default async function handler(req, res) {
 
   async function callGemini(p, model, hist, key, sys) {
     if (!key) throw new Error('No key');
-    const parts = hasImages ? buildGeminiParts(sys + '\n\n' + p) : [{ text: sys + '\n\n' + p }];
-    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { maxOutputTokens: INDIVIDUAL_MAX_TOKENS } }) });
+    // Gemini uses a 'contents' array of {role, parts} where role is 'user' or 'model'.
+    // Map the conversation history into that format so Gemini has context.
+    const contents = [];
+    (hist || []).forEach(m => {
+      const role = (m.role === 'assistant') ? 'model' : 'user';
+      contents.push({ role, parts: [{ text: m.content }] });
+    });
+    // Final user message — with images attached if present
+    const finalParts = hasImages ? buildGeminiParts(p) : [{ text: p }];
+    contents.push({ role: 'user', parts: finalParts });
+    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents,
+        systemInstruction: { parts: [{ text: sys }] },  // Gemini's dedicated system-instruction slot
+        generationConfig: { maxOutputTokens: INDIVIDUAL_MAX_TOKENS }
+      })
+    });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Gemini error ' + r.status); }
     return (await r.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
   }
@@ -573,12 +604,19 @@ export default async function handler(req, res) {
       if (wantsStream) sendEvent('complexity', { complexity: 'debate', models: names });
       if (wantsStream) sendEvent('debate_round', { round: 1 });
 
-      // ── Grok with single retry (debate tolerates the extra ~2s for reliability) ──
+      // ── Grok with single retry on error OR empty response ──
+      // Grok is the flakiest of the four — sometimes it returns HTTP 200 with empty content.
       async function callGrokRetry(p, model, hist, key, sys) {
         try {
-          return await callGrok(p, model, hist, key, sys);
+          const text = await callGrok(p, model, hist, key, sys);
+          if (text && text.trim()) return text;
+          // Empty response - retry once
+          await new Promise(r => setTimeout(r, 1200));
+          const text2 = await callGrok(p, model, hist, key, sys);
+          if (!text2 || !text2.trim()) throw new Error('Grok returned empty after retry');
+          return text2;
         } catch (e) {
-          // One retry after brief pause
+          // Error on first try - retry once
           await new Promise(r => setTimeout(r, 1200));
           return await callGrok(p, model, hist, key, sys);
         }
@@ -669,12 +707,14 @@ export default async function handler(req, res) {
       const round2Results = await Promise.all(r2Promises);
 
       // Merge round 1 and round 2 into per-AI "full argument" blocks for individual display
+      // IMPORTANT: the separator pattern must match renderDebateResponse's split:
+      //   '\n\n---\n\n**Rebuttal:**\n\n'
       const fullIndividual = round1Success.map(r1 => {
         const r2 = round2Results.find(x => x.name === r1.name);
         const r2Text = (r2 && r2.ok && r2.text) ? r2.text : '[No rebuttal]';
         return {
           name: r1.name,
-          text: '**Opening Argument:**\n\n' + r1.text + '\n\n**Rebuttal:**\n\n' + r2Text,
+          text: r1.text + '\n\n---\n\n**Rebuttal:**\n\n' + r2Text,
           openingArgument: r1.text,
           rebuttal: r2Text,
         };
