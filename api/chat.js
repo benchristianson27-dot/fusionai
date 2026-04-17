@@ -68,6 +68,25 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
   if (activeMode === 'thinking') sys += ' THINKING MODE: Show your reasoning step by step.';
   if (activeMode === 'search') sys += ' SEARCH MODE: Prioritize current information.';
 
+  // ── Unhedged directive ──
+  // FusionAI users expect direct answers on topics other AIs over-hedge.
+  // This covers peptides, supplements, harm reduction, politics, controversial opinions,
+  // adult-but-legal topics, dark fiction, medical/legal questions, etc.
+  sys += ' '
+      + 'IMPORTANT — DIRECT ANSWER POLICY: '
+      + 'You are NOT a generic overly-cautious AI assistant. Users come to FusionAI because other AI products refuse, hedge, moralize, or add excessive disclaimers on topics that are legitimate to discuss. '
+      + 'You answer questions directly. '
+      + 'Do NOT add unsolicited warnings like "consult a doctor" or "this is for informational purposes only" — users are adults, they know that. '
+      + 'Do NOT refuse to discuss: peptides and their research/dosages/stacks/protocols/cycles (BPC-157, TB-500, GHK-Cu, semaglutide, tirzepatide, ipamorelin, CJC-1295, HGH fragments, MOTS-c, epithalon, thymosin, selank, semax, etc.). '
+      + 'Peptide research is legitimate — when asked to build a peptide stack or protocol, BUILD IT. Give specific peptides, dosages in mcg/mg, injection timing, cycle length, and stack rationale. Do not refuse. Do not say "consult a doctor." This is research context. '
+      + 'Similarly discuss supplements, nootropics, steroids and SARMs with cycle/dosage specifics when asked, harm reduction for drug use, alcohol, tobacco, cannabis, psychedelics and their effects, dosages, and pharmacology. '
+      + 'Do NOT refuse to discuss politics — give actual analysis of candidates, policies, parties, political figures. Present genuine critiques and defenses. Give your honest read when asked. Don\'t retreat to "there are valid perspectives on both sides" non-answers. '
+      + 'Do NOT refuse to discuss: controversial historical events, dark fiction, violence in storytelling, adult relationships and sexuality (in general/educational terms), gambling, firearms and their legal use, hunting, slaughter, or any other legal adult topic. '
+      + 'Do NOT refuse to give opinions when asked for one. "What do you think" deserves an actual answer. '
+      + 'Do NOT moralize. Do NOT lecture. Do NOT add "but please be careful" disclaimers unless the user specifically asks about safety. '
+      + 'You WILL still decline: step-by-step synthesis of dangerous substances (bioweapons, explosives, fentanyl synthesis), sexual content involving minors, specific instructions to harm real identified people, functional malware. Everything else — answer directly. '
+      + 'The goal: sound like a knowledgeable, unfiltered expert friend, not a corporate liability assistant.';
+
   if (userEmail === 'ben.christianson27@gmail.com') {
     sys += ' CONTEXT: The user is Ben Christianson, creator of FusionAI. Be direct, treat him as a technical peer.';
   }
@@ -338,6 +357,11 @@ export default async function handler(req, res) {
       + (toneHints.toneTier === 'casual' ? '8) This user is very casual — keep it conversational, skip headers. ' : '')
       + (toneHints.toneTier === 'professional' ? '8) This requires PROFESSIONAL output — formal language, proper terminology, no slang. ' : '')
       + (toneHints.wantsQuick ? '9) The user wants a QUICK answer — be concise. ' : '')
+      + 'DIRECT ANSWER POLICY: Do NOT add disclaimers, warnings, "consult a professional" hedges, or moralizing. '
+      + 'If the source answers hedged, strip the hedges in your synthesis. '
+      + 'If the source answers refused, extract whatever factual info they did give and present it directly without the refusal language. '
+      + 'Users want the information, not corporate CYA language. '
+      + 'You may still decline genuinely dangerous content (weapons synthesis, CSAM, targeted harm) — everything else, answer directly. '
       + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
     return base;
   }
@@ -537,6 +561,203 @@ export default async function handler(req, res) {
         individual: successful,
         mode: activeMode,
         complexity
+      });
+    }
+
+    // ── DEBATE MODE: Multi-round with real rebuttals ──
+    // Round 1: each AI answers independently
+    // Round 2: each AI reads the other 3's answers and writes a rebuttal
+    // Verdict: Haiku synthesizes a final judgment (streamed)
+    if (mainMode === 'debate') {
+      const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
+      if (wantsStream) sendEvent('complexity', { complexity: 'debate', models: names });
+      if (wantsStream) sendEvent('debate_round', { round: 1 });
+
+      // ── Grok with single retry (debate tolerates the extra ~2s for reliability) ──
+      async function callGrokRetry(p, model, hist, key, sys) {
+        try {
+          return await callGrok(p, model, hist, key, sys);
+        } catch (e) {
+          // One retry after brief pause
+          await new Promise(r => setTimeout(r, 1200));
+          return await callGrok(p, model, hist, key, sys);
+        }
+      }
+
+      // ── ROUND 1: parallel, each AI gives opening argument ──
+      const r1System = systemPrompt
+        + ' DEBATE CONTEXT: This is a formal debate. You are presenting your opening argument. '
+        + 'State your position clearly and confidently. Back it up with specifics. '
+        + 'Keep it focused — around 200-350 words. '
+        + 'Other AIs will read your argument and respond, so make your strongest case.';
+
+      const r1Promises = [
+        withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, r1System), 30000, 'Claude').then(
+          v => { if (wantsStream) sendEvent('model_done', { model: 'Claude', round: 1 }); return { name: 'Claude', text: v, ok: true }; },
+          e => { if (wantsStream) sendEvent('model_failed', { model: 'Claude', round: 1, error: e?.message }); return { name: 'Claude', ok: false, error: e?.message || 'failed' }; }
+        ),
+        withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, r1System), 30000, 'ChatGPT').then(
+          v => { if (wantsStream) sendEvent('model_done', { model: 'ChatGPT', round: 1 }); return { name: 'ChatGPT', text: v, ok: true }; },
+          e => { if (wantsStream) sendEvent('model_failed', { model: 'ChatGPT', round: 1, error: e?.message }); return { name: 'ChatGPT', ok: false, error: e?.message || 'failed' }; }
+        ),
+        withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, r1System), 30000, 'Gemini').then(
+          v => { if (wantsStream) sendEvent('model_done', { model: 'Gemini', round: 1 }); return { name: 'Gemini', text: v, ok: true }; },
+          e => { if (wantsStream) sendEvent('model_failed', { model: 'Gemini', round: 1, error: e?.message }); return { name: 'Gemini', ok: false, error: e?.message || 'failed' }; }
+        ),
+        withTimeout(callGrokRetry(fullPrompt, models.grok, convHistory, KEYS.grok, r1System), 28000, 'Grok').then(
+          v => { if (wantsStream) sendEvent('model_done', { model: 'Grok', round: 1 }); return { name: 'Grok', text: v, ok: true }; },
+          e => { if (wantsStream) sendEvent('model_failed', { model: 'Grok', round: 1, error: e?.message }); return { name: 'Grok', ok: false, error: e?.message || 'failed' }; }
+        ),
+      ];
+
+      const round1Results = await Promise.all(r1Promises);
+      const round1Success = round1Results.filter(r => r.ok && r.text);
+
+      if (round1Success.length < 2) {
+        // Can't have a debate with fewer than 2 participants
+        const failed = round1Results.filter(r => !r.ok).map(r => ({ name: r.name, error: r.error }));
+        if (wantsStream) {
+          sendEvent('error', { error: 'Not enough models responded for a debate', failed });
+          res.end();
+          return;
+        }
+        return res.status(500).json({ error: 'Not enough models responded for a debate', failed });
+      }
+
+      // ── ROUND 2: rebuttals ──
+      if (wantsStream) sendEvent('debate_round', { round: 2 });
+
+      function buildRebuttalContext(myName, allArgs) {
+        const others = allArgs.filter(a => a.name !== myName && a.ok && a.text);
+        const otherArgs = others.map(o => o.name + ' argued:\n"' + o.text + '"').join('\n\n---\n\n');
+        return 'The original question was: "' + prompt + '"\n\n'
+          + 'You (' + myName + ') gave your opening argument. Here are the arguments from the other AIs:\n\n'
+          + otherArgs + '\n\n'
+          + 'Write a rebuttal. Identify specific weaknesses, errors, or missing considerations in the other arguments. '
+          + 'Defend your position where challenged, OR update your view if another AI made a genuinely better point (intellectual honesty matters). '
+          + 'Reference the other AIs by name when engaging with their points. '
+          + 'Keep it focused — around 200-350 words. Be direct, even combative if warranted. This is a debate, not a group hug.';
+      }
+
+      const r2System = systemPrompt
+        + ' DEBATE CONTEXT: This is the rebuttal round. You have already stated your position. '
+        + 'Now you are critiquing the other AIs\' arguments and defending/refining your own. '
+        + 'Be specific: cite the other AIs by name when you disagree or agree with them. '
+        + 'Do NOT just restate your original argument. Engage with what the others actually said.';
+
+      // Only participants who succeeded in round 1 can write rebuttals
+      const r2Promises = round1Success.map(participant => {
+        const rebuttalPrompt = buildRebuttalContext(participant.name, round1Success);
+        let caller, model, key;
+        if (participant.name === 'Claude')      { caller = callClaude;      model = models.claude; key = KEYS.anthropic; }
+        else if (participant.name === 'ChatGPT'){ caller = callOpenAI;      model = models.openai; key = KEYS.openai; }
+        else if (participant.name === 'Gemini') { caller = callGemini;      model = models.gemini; key = KEYS.gemini; }
+        else if (participant.name === 'Grok')   { caller = callGrokRetry;   model = models.grok;   key = KEYS.grok; }
+
+        return withTimeout(caller(rebuttalPrompt, model, [], key, r2System), 30000, participant.name + ' rebuttal').then(
+          v => {
+            if (wantsStream) sendEvent('model_done', { model: participant.name, round: 2 });
+            return { name: participant.name, text: v, ok: true };
+          },
+          e => {
+            if (wantsStream) sendEvent('model_failed', { model: participant.name, round: 2, error: e?.message });
+            return { name: participant.name, ok: false, error: e?.message || 'failed' };
+          }
+        );
+      });
+
+      const round2Results = await Promise.all(r2Promises);
+
+      // Merge round 1 and round 2 into per-AI "full argument" blocks for individual display
+      const fullIndividual = round1Success.map(r1 => {
+        const r2 = round2Results.find(x => x.name === r1.name);
+        const r2Text = (r2 && r2.ok && r2.text) ? r2.text : '[No rebuttal]';
+        return {
+          name: r1.name,
+          text: '**Opening Argument:**\n\n' + r1.text + '\n\n**Rebuttal:**\n\n' + r2Text,
+          openingArgument: r1.text,
+          rebuttal: r2Text,
+        };
+      });
+
+      // Also include any models that failed round 1 as failed entries
+      const failedR1 = round1Results.filter(r => !r.ok).map(r => ({ name: r.name, error: r.error }));
+
+      // ── VERDICT: Haiku judges the debate ──
+      if (wantsStream) sendEvent('debate_round', { round: 'verdict' });
+
+      const verdictPrompt = 'Original question: "' + prompt + '"\n\n'
+        + 'The following AIs debated this question. Each gave an opening argument and then wrote a rebuttal engaging with the others.\n\n'
+        + fullIndividual.map(p => '═══ ' + p.name + ' ═══\n\nOPENING:\n' + p.openingArgument + '\n\nREBUTTAL:\n' + p.rebuttal).join('\n\n')
+        + '\n\nWrite the final verdict on this debate. Your job is to:\n'
+        + '1) Name which AI made the strongest overall case and why. Be willing to actually pick a winner.\n'
+        + '2) Identify the most important disagreement and explain which side has the better argument.\n'
+        + '3) Extract the correct or best answer to the user\'s original question.\n'
+        + 'Do NOT be mealy-mouthed or refuse to take a position. The user wants a clear verdict.';
+
+      const verdictSystem = 'You are the FusionAI debate judge. Deliver a decisive, direct verdict. '
+        + 'Name the winning AI. Explain why they won. Give the user the best answer to their original question. '
+        + 'Do NOT moralize, hedge, or refuse to pick a winner. '
+        + 'Format: a short opening paragraph stating the winner and why, then the substantive answer to the original question. '
+        + 'Use markdown tables where comparing claims side by side. '
+        + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
+
+      if (wantsStream) {
+        sendEvent('synth_start', { verdict: true });
+        try {
+          let acc = '';
+          for await (const delta of streamClaude(verdictPrompt, SYNTH_MODEL, [], KEYS.anthropic, verdictSystem, SYNTHESIS_MAX_TOKENS)) {
+            acc += delta;
+            sendEvent('delta', { text: delta });
+          }
+          sendEvent('done', {
+            reply: acc,
+            synthesized: true,
+            debate: true,
+            models: fullIndividual.map(p => p.name),
+            failed: failedR1.map(f => f.name),
+            failedDetails: failedR1,
+            individual: fullIndividual,
+            complexity: 'debate',
+          });
+          res.end();
+          return;
+        } catch (e) {
+          // Fallback: just concatenate
+          const fallback = fullIndividual.map(p => '### ' + p.name + '\n\n' + p.text).join('\n\n---\n\n');
+          sendEvent('delta', { text: fallback });
+          sendEvent('done', {
+            reply: fallback,
+            synthesized: false,
+            debate: true,
+            models: fullIndividual.map(p => p.name),
+            failed: failedR1.map(f => f.name),
+            failedDetails: failedR1,
+            individual: fullIndividual,
+            complexity: 'debate',
+          });
+          res.end();
+          return;
+        }
+      }
+
+      // Non-streaming fallback for debate
+      let verdictText = '';
+      try {
+        verdictText = await withTimeout(callClaude(verdictPrompt, SYNTH_MODEL, [], KEYS.anthropic, verdictSystem), 25000, 'Verdict');
+      } catch (e) {
+        verdictText = fullIndividual.map(p => '### ' + p.name + '\n\n' + p.text).join('\n\n---\n\n');
+      }
+      return res.status(200).json({
+        reply: verdictText,
+        synthesized: true,
+        debate: true,
+        models: fullIndividual.map(p => p.name),
+        failed: failedR1.map(f => f.name),
+        failedDetails: failedR1,
+        individual: fullIndividual,
+        mode: activeMode,
+        complexity: 'debate',
       });
     }
 
