@@ -985,8 +985,8 @@ export default async function handler(req, res) {
         sendEvent('complexity', { complexity, models: ['Claude', 'Gemini'] });
         // Immediately mark ChatGPT and Grok as skipped so the Workstation cards
         // don't hang on "Thinking" — this is a simple-enough query that only 2 models run.
-        sendEvent('individual_failed', { model: 'ChatGPT', error: 'Skipped — quick query only needs 2 models' });
-        sendEvent('individual_failed', { model: 'Grok', error: 'Skipped — quick query only needs 2 models' });
+        sendEvent('individual_not_needed', { model: 'ChatGPT' });
+        sendEvent('individual_not_needed', { model: 'Grok' });
       }
 
       // Use streaming variants so the Workstation can show live text for each AI.
@@ -1019,8 +1019,8 @@ export default async function handler(req, res) {
       failed = mediumResults.filter(r => !r.ok).map(r => ({ name: r.name, error: r.error }));
 
       const skipped = [
-        { name: 'ChatGPT', error: 'Skipped (quick query)' },
-        { name: 'Grok', error: 'Skipped (quick query)' },
+        { name: 'ChatGPT', error: 'Not needed for this query', notNeeded: true },
+        { name: 'Grok', error: 'Not needed for this query', notNeeded: true },
       ];
 
       if (successful.length === 0) {
