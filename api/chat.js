@@ -659,6 +659,165 @@ export default async function handler(req, res) {
     }
   }
 
+  // ── STREAMING VARIANTS for individual AI calls ──
+  // These are used in the complex path so the Workstation can show each AI's
+  // response streaming in real-time. Each async generator yields text deltas.
+  // On failure, throws.
+
+  async function* streamOpenAI(p, model, hist, key, sys, maxTokens, useWebSearch) {
+    if (!key) throw new Error('No key');
+    const userContent = hasImages ? buildOpenAIContent(p) : p;
+    const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
+    const maxTok = maxTokens || INDIVIDUAL_MAX_TOKENS;
+
+    // NOTE: the Responses API (for web search) doesn't stream easily in this same shape.
+    // We use Chat Completions streaming for all cases and accept that web search for ChatGPT
+    // isn't included in the individual call during streaming. The synthesizer still has search capability.
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({ model, max_tokens: maxTok, messages, stream: true }),
+    });
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI stream error ' + r.status); }
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (!data || data === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed.choices?.[0]?.delta?.content;
+            if (delta) yield delta;
+          } catch { /* skip */ }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  async function* streamGemini(p, model, hist, key, sys, maxTokens, useWebSearch) {
+    if (!key) throw new Error('No key');
+    const contents = [];
+    (hist || []).forEach(m => {
+      const role = (m.role === 'assistant') ? 'model' : 'user';
+      contents.push({ role, parts: [{ text: m.content }] });
+    });
+    const finalParts = hasImages ? buildGeminiParts(p) : [{ text: p }];
+    contents.push({ role: 'user', parts: finalParts });
+
+    const body = {
+      contents,
+      systemInstruction: { parts: [{ text: sys }] },
+      generationConfig: { maxOutputTokens: maxTokens || INDIVIDUAL_MAX_TOKENS },
+    };
+    if (useWebSearch) body.tools = [{ google_search: {} }];
+
+    // Gemini streaming endpoint uses streamGenerateContent with alt=sse
+    const r = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':streamGenerateContent?alt=sse&key=' + key,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+    );
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Gemini stream error ' + r.status); }
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (!data) continue;
+          try {
+            const parsed = JSON.parse(data);
+            const parts = parsed.candidates?.[0]?.content?.parts || [];
+            for (const part of parts) {
+              if (part.text) yield part.text;
+            }
+          } catch { /* skip */ }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  async function* streamGrok(p, model, hist, key, sys, maxTokens, useWebSearch) {
+    if (!key) throw new Error('No key');
+    const userContent = hasImages ? buildOpenAIContent(p) : p;
+    const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
+    const maxTok = maxTokens || INDIVIDUAL_MAX_TOKENS;
+
+    const r = await fetch('https://api.x.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({ model, max_tokens: maxTok, messages, stream: true }),
+    });
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error('Grok stream error ' + r.status); }
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (!data || data === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed.choices?.[0]?.delta?.content;
+            if (delta) yield delta;
+          } catch { /* skip */ }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  // ── Helper: drains an async generator, emits SSE events per delta, returns full text.
+  // Used in the complex path to stream all 4 AIs in parallel.
+  // Each streamer is called with a modelName. SSE events: individual_delta, individual_done, individual_failed.
+  async function runStreamForModel(modelName, streamGeneratorFn) {
+    let fullText = '';
+    try {
+      if (wantsStream) sendEvent('individual_start', { model: modelName });
+      for await (const delta of streamGeneratorFn()) {
+        fullText += delta;
+        if (wantsStream) sendEvent('individual_delta', { model: modelName, text: delta });
+      }
+      if (!fullText.trim()) throw new Error('Empty response');
+      if (wantsStream) sendEvent('individual_done', { model: modelName, text: fullText });
+      return { name: modelName, text: fullText, ok: true };
+    } catch (err) {
+      const msg = err?.message || 'Stream failed';
+      if (wantsStream) sendEvent('individual_failed', { model: modelName, error: msg });
+      return { name: modelName, text: null, ok: false, error: msg };
+    }
+  }
+
   // ── SSE helpers ──
   function setupSSE() {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -1129,51 +1288,55 @@ export default async function handler(req, res) {
       });
     }
 
-    // ── COMPLEX: 4 models with race logic (start synthesis when 3/4 in) ──
+    // ── COMPLEX: 4 models streamed in parallel (new streaming path) ──
     if (wantsStream) sendEvent('complexity', { complexity, models: ['Claude', 'ChatGPT', 'Gemini', 'Grok'] });
 
-    // WIN #3: Grok gets tighter timeout because it's typically the slowest
-    const claudeP = withTimeout(claudeAsk(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
-    const gptP = withTimeout(openaiAsk(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 25000, 'ChatGPT');
-    const geminiP = withTimeout(geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
-    const grokP = withTimeout(grokAsk(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 20000, 'Grok');
-
-    // Track each result as it arrives
+    // Each stream runs in parallel and emits individual_delta events tagged by model.
+    // Frontend demuxes them into the Workstation cards in real-time.
+    // We race for completion: proceed with synthesis when 3/4 are done OR after total timeout.
     const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
-    const promises = [claudeP, gptP, geminiP, grokP];
-
-    // Manually collect with event emission as they land (true streaming of progress)
     const collected = [];
     const settledFlags = [false, false, false, false];
 
-    const wrapped = promises.map((p, i) =>
+    // Build the promises — each runs its stream and returns when the stream completes.
+    // WIN #3: Grok gets tighter timeout because it's typically the slowest.
+    const streamPromises = [
+      withTimeout(runStreamForModel('Claude',  () => streamClaude (fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)), 25000, 'Claude'),
+      withTimeout(runStreamForModel('ChatGPT', () => streamOpenAI (fullPrompt, models.openai, convHistory, KEYS.openai,    systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)), 25000, 'ChatGPT'),
+      withTimeout(runStreamForModel('Gemini',  () => streamGemini (fullPrompt, models.gemini, convHistory, KEYS.gemini,    systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)), 25000, 'Gemini'),
+      withTimeout(runStreamForModel('Grok',    () => streamGrok   (fullPrompt, models.grok,   convHistory, KEYS.grok,      systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)), 20000, 'Grok'),
+    ];
+
+    const wrapped = streamPromises.map((p, i) =>
       p.then(
-        value => {
+        result => {
           settledFlags[i] = true;
-          if (value) {
-            collected.push({ name: names[i], text: value, ok: true });
-            if (wantsStream) sendEvent('model_done', { model: names[i] });
-          } else {
-            collected.push({ name: names[i], text: null, ok: false, error: 'Empty' });
-            if (wantsStream) sendEvent('model_failed', { model: names[i], error: 'Empty' });
+          collected.push(result);
+          // Emit legacy model_done/model_failed for backward compatibility with older clients
+          if (wantsStream) {
+            if (result.ok) sendEvent('model_done', { model: names[i] });
+            else sendEvent('model_failed', { model: names[i], error: result.error });
           }
         },
         err => {
           settledFlags[i] = true;
-          collected.push({ name: names[i], text: null, ok: false, error: err?.message || 'Unknown' });
-          if (wantsStream) sendEvent('model_failed', { model: names[i], error: err?.message || 'Unknown' });
+          const result = { name: names[i], text: null, ok: false, error: err?.message || 'Unknown' };
+          collected.push(result);
+          if (wantsStream) {
+            sendEvent('individual_failed', { model: names[i], error: result.error });
+            sendEvent('model_failed', { model: names[i], error: result.error });
+          }
         }
       )
     );
 
     // WIN #3 (race): resolve when we have 3 successes OR all 4 settled, whichever first
-    // Wait max 15s for 3rd response after first response came in
-    let firstResponseTime = null;
+    // Wait max 4s for 4th response after 3 are in
     function successCount() { return collected.filter(c => c.ok).length; }
     function allDone() { return settledFlags.every(f => f); }
 
     const startTime = Date.now();
-    const MAX_WAIT_AFTER_3 = 4000; // ms to wait for 4th after 3 are in
+    const MAX_WAIT_AFTER_3 = 4000;
 
     await new Promise(resolve => {
       let resolved = false;
@@ -1184,17 +1347,13 @@ export default async function handler(req, res) {
         if (raceTimer) clearTimeout(raceTimer);
         resolve();
       }
-      // Check every 150ms whether we should proceed
       const checker = setInterval(() => {
         if (allDone()) { clearInterval(checker); done(); return; }
         if (successCount() >= 3 && !raceTimer) {
-          // Start 4-second grace period for Grok/stragglers
           raceTimer = setTimeout(() => { clearInterval(checker); done(); }, MAX_WAIT_AFTER_3);
         }
-        // Hard ceiling at 25s total (timeouts should have fired, but belt-and-suspenders)
         if (Date.now() - startTime > 26000) { clearInterval(checker); done(); }
       }, 150);
-      // Also resolve naturally when all complete
       Promise.all(wrapped).then(() => { clearInterval(checker); done(); });
     });
 
@@ -1247,13 +1406,13 @@ export default async function handler(req, res) {
           acc += delta;
           sendEvent('delta', { text: delta });
         }
-        sendEvent('done', { reply: acc, synthesized: true, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity });
+        sendEvent('done', { reply: acc, synthesized: true, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity, individual: successful });
         res.end();
         return;
       } catch (e) {
         const fallback = successful[0].text;
         sendEvent('delta', { text: fallback });
-        sendEvent('done', { reply: fallback, synthesized: false, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity });
+        sendEvent('done', { reply: fallback, synthesized: false, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity, individual: successful });
         res.end();
         return;
       }
