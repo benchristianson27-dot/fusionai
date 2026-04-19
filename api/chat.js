@@ -236,8 +236,20 @@ export default async function handler(req, res) {
 
   // WIN #5: max_tokens dropped from 3000 to 1500 for individual calls
   // Synthesis gets 2000 (slightly more room since it's the final answer)
+  // Debate mode gets more (2500) so opening arguments and rebuttals never truncate mid-sentence
   const INDIVIDUAL_MAX_TOKENS = 1500;
   const SYNTHESIS_MAX_TOKENS = 2000;
+  const DEBATE_MAX_TOKENS = 2500;
+
+  // ── Fallback models: cheap/fast siblings that almost always work ──
+  // Used when the primary tier model fails all retries in debate mode.
+  // Same provider so the debate label stays honest ("Claude" stays "Claude").
+  const FALLBACK_MODELS = {
+    claude: 'claude-haiku-4-5-20251001',
+    openai: 'gpt-4o-mini',
+    gemini: 'gemini-2.5-flash',
+    grok: 'grok-4-1-fast-non-reasoning',
+  };
 
   // ── Web search configuration ──
   // Tool is always ATTACHED; each model decides autonomously whether to USE it.
@@ -294,38 +306,84 @@ export default async function handler(req, res) {
   }
 
   // ── Wrappers that pass useWebSearch=true (always on), record any searches to SSE,
-  // and return just the text string (matching the legacy API). Callers that need
-  // the search metadata can use the *_full variants below.
-  async function claudeAsk(p, model, hist, key, sys) {
-    const r = await callClaude(p, model, hist, key, sys, WEB_SEARCH_ENABLED);
+  // and return just the text string. Accept optional maxTokens override.
+  async function claudeAsk(p, model, hist, key, sys, maxTokens) {
+    const r = await callClaude(p, model, hist, key, sys, WEB_SEARCH_ENABLED, maxTokens);
     if (r.searched) recordSearch('claude', '', r.sources);
     return r.text;
   }
-  async function openaiAsk(p, model, hist, key, sys) {
-    const r = await callOpenAI(p, model, hist, key, sys, WEB_SEARCH_ENABLED);
+  async function openaiAsk(p, model, hist, key, sys, maxTokens) {
+    const r = await callOpenAI(p, model, hist, key, sys, WEB_SEARCH_ENABLED, maxTokens);
     if (r.searched) recordSearch('chatgpt', '', r.sources);
     return r.text;
   }
-  async function geminiAsk(p, model, hist, key, sys) {
-    const r = await callGemini(p, model, hist, key, sys, WEB_SEARCH_ENABLED);
+  async function geminiAsk(p, model, hist, key, sys, maxTokens) {
+    const r = await callGemini(p, model, hist, key, sys, WEB_SEARCH_ENABLED, maxTokens);
     if (r.searched) recordSearch('gemini', '', r.sources);
     return r.text;
   }
-  async function grokAsk(p, model, hist, key, sys) {
-    const r = await callGrok(p, model, hist, key, sys, WEB_SEARCH_ENABLED);
+  async function grokAsk(p, model, hist, key, sys, maxTokens) {
+    const r = await callGrok(p, model, hist, key, sys, WEB_SEARCH_ENABLED, maxTokens);
     if (r.searched) recordSearch('grok', '', r.sources);
     return r.text;
+  }
+
+  // ── Retry wrapper: retries on empty response OR error, with 800ms backoff.
+  // Used in debate mode where we really need every AI to respond.
+  // Returns text or throws. Does NOT cross models — use fallbackAsk for cross-provider.
+  async function askWithRetry(askFn, p, model, hist, key, sys, maxTokens, maxAttempts) {
+    const attempts = maxAttempts || 2;
+    let lastErr = null;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const text = await askFn(p, model, hist, key, sys, maxTokens);
+        if (text && text.trim()) return text;
+        // Empty response counts as failure for retry purposes
+        lastErr = new Error('Empty response');
+      } catch (e) {
+        lastErr = e;
+      }
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, 800));
+    }
+    throw lastErr || new Error('All retries exhausted');
+  }
+
+  // ── Retry-with-fallback wrapper: try primary model 2x, then fallback model 2x.
+  // This is what guarantees debate mode participation — a given AI will only fail
+  // if BOTH its primary and its cheap sibling are down.
+  // providerKey: 'claude' | 'openai' | 'gemini' | 'grok' — used to look up fallback model.
+  // Returns { text, usedFallback } or throws if everything failed.
+  async function askWithFallback(askFn, p, primaryModel, hist, key, sys, maxTokens, providerKey) {
+    // Attempt 1: primary model with retries
+    try {
+      const text = await askWithRetry(askFn, p, primaryModel, hist, key, sys, maxTokens, 2);
+      return { text, usedFallback: false };
+    } catch (primaryErr) {
+      // Attempt 2: fallback model with retries
+      const fallbackModel = FALLBACK_MODELS[providerKey];
+      if (!fallbackModel || fallbackModel === primaryModel) {
+        // No different fallback available — give up
+        throw primaryErr;
+      }
+      try {
+        const text = await askWithRetry(askFn, p, fallbackModel, hist, key, sys, maxTokens, 2);
+        return { text, usedFallback: true };
+      } catch (fallbackErr) {
+        // Both failed — throw the more informative one
+        throw new Error('Primary: ' + primaryErr.message + '; Fallback: ' + fallbackErr.message);
+      }
+    }
   }
 
   // ── Non-streaming callers (for the initial four queries) ──
   // Each caller accepts useWebSearch. When true, the provider's native web search tool is attached.
   // Each returns an object: { text: string, searched: boolean, sources: string[] }
 
-  async function callClaude(p, model, hist, key, sys, useWebSearch) {
+  async function callClaude(p, model, hist, key, sys, useWebSearch, maxTokensOverride) {
     if (!key) throw new Error('No key');
     const userContent = hasImages ? buildClaudeContent(p) : p;
     const messages = hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: userContent }]);
-    const body = { model, max_tokens: INDIVIDUAL_MAX_TOKENS, system: sys, messages };
+    const body = { model, max_tokens: maxTokensOverride || INDIVIDUAL_MAX_TOKENS, system: sys, messages };
     if (useWebSearch) {
       body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }];
     }
@@ -356,10 +414,11 @@ export default async function handler(req, res) {
     return { text: text || '', searched, sources: sources.slice(0, 10) };
   }
 
-  async function callOpenAI(p, model, hist, key, sys, useWebSearch) {
+  async function callOpenAI(p, model, hist, key, sys, useWebSearch, maxTokensOverride) {
     if (!key) throw new Error('No key');
     const userContent = hasImages ? buildOpenAIContent(p) : p;
     const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
+    const maxTok = maxTokensOverride || INDIVIDUAL_MAX_TOKENS;
 
     // OpenAI has two paths. Their "web_search_preview" tool requires the Responses API
     // (POST /v1/responses) on models like gpt-4o-search-preview, OR the classic Chat Completions
@@ -373,7 +432,7 @@ export default async function handler(req, res) {
         model,
         input,
         tools: [{ type: 'web_search_preview' }],
-        max_output_tokens: INDIVIDUAL_MAX_TOKENS,
+        max_output_tokens: maxTok,
       };
       const r = await fetch('https://api.openai.com/v1/responses', {
         method: 'POST',
@@ -411,14 +470,14 @@ export default async function handler(req, res) {
     const r = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-      body: JSON.stringify({ model, max_tokens: INDIVIDUAL_MAX_TOKENS, messages }),
+      body: JSON.stringify({ model, max_tokens: maxTok, messages }),
     });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI error ' + r.status); }
     const data = await r.json();
     return { text: data.choices?.[0]?.message?.content || '', searched: false, sources: [] };
   }
 
-  async function callGemini(p, model, hist, key, sys, useWebSearch) {
+  async function callGemini(p, model, hist, key, sys, useWebSearch, maxTokensOverride) {
     if (!key) throw new Error('No key');
     const contents = [];
     (hist || []).forEach(m => {
@@ -431,7 +490,7 @@ export default async function handler(req, res) {
     const body = {
       contents,
       systemInstruction: { parts: [{ text: sys }] },
-      generationConfig: { maxOutputTokens: INDIVIDUAL_MAX_TOKENS },
+      generationConfig: { maxOutputTokens: maxTokensOverride || INDIVIDUAL_MAX_TOKENS },
     };
     if (useWebSearch) {
       // Google Search grounding — dedicated tool for Gemini 2.x
@@ -462,10 +521,11 @@ export default async function handler(req, res) {
     return { text: text || '', searched, sources: sources.slice(0, 10) };
   }
 
-  async function callGrok(p, model, hist, key, sys, useWebSearch) {
+  async function callGrok(p, model, hist, key, sys, useWebSearch, maxTokensOverride) {
     if (!key) throw new Error('No key');
     const userContent = hasImages ? buildOpenAIContent(p) : p;
     const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
+    const maxTok = maxTokensOverride || INDIVIDUAL_MAX_TOKENS;
 
     if (useWebSearch) {
       // xAI Responses API with web_search tool — endpoint is /v1/responses
@@ -475,6 +535,7 @@ export default async function handler(req, res) {
         model,
         input,
         tools: [{ type: 'web_search' }],
+        max_output_tokens: maxTok,
       };
       const r = await fetch('https://api.x.ai/v1/responses', {
         method: 'POST',
@@ -509,7 +570,7 @@ export default async function handler(req, res) {
     const r = await fetch('https://api.x.ai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-      body: JSON.stringify({ model, max_tokens: INDIVIDUAL_MAX_TOKENS, messages }),
+      body: JSON.stringify({ model, max_tokens: maxTok, messages }),
     });
     if (!r.ok) throw new Error('Grok error ' + r.status);
     const data = await r.json();
@@ -847,31 +908,15 @@ export default async function handler(req, res) {
     }
 
     // ── DEBATE MODE: Multi-round with real rebuttals ──
-    // Round 1: each AI answers independently
-    // Round 2: each AI reads the other 3's answers and writes a rebuttal
+    // Round 1: each AI answers independently (with retry + fallback to cheap sibling)
+    // Round 2: each AI reads the other 3's answers and writes a rebuttal (same fallback logic)
     // Verdict: Haiku synthesizes a final judgment (streamed)
+    // Goal: every AI always responds. A given AI only fails if BOTH its primary and
+    // its cheap fallback sibling are down simultaneously.
     if (mainMode === 'debate') {
       const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
       if (wantsStream) sendEvent('complexity', { complexity: 'debate', models: names });
       if (wantsStream) sendEvent('debate_round', { round: 1 });
-
-      // ── Grok with single retry on error OR empty response ──
-      // Grok is the flakiest of the four — sometimes it returns HTTP 200 with empty content.
-      async function callGrokRetry(p, model, hist, key, sys) {
-        try {
-          const text = await grokAsk(p, model, hist, key, sys);
-          if (text && text.trim()) return text;
-          // Empty response - retry once
-          await new Promise(r => setTimeout(r, 1200));
-          const text2 = await grokAsk(p, model, hist, key, sys);
-          if (!text2 || !text2.trim()) throw new Error('Grok returned empty after retry');
-          return text2;
-        } catch (e) {
-          // Error on first try - retry once
-          await new Promise(r => setTimeout(r, 1200));
-          return await grokAsk(p, model, hist, key, sys);
-        }
-      }
 
       // ── ROUND 1: parallel, each AI gives opening argument ──
       const r1System = systemPrompt
@@ -880,23 +925,32 @@ export default async function handler(req, res) {
         + 'Keep it focused — around 200-350 words. '
         + 'Other AIs will read your argument and respond, so make your strongest case.';
 
+      // Per-AI timeout ceiling — tight enough that Round 1 + Round 2 + verdict stay under Vercel's 60s.
+      // Budget: round1 (25s) + round2 (25s) + verdict stream (~10s) = ~60s. Each round runs all 4 AIs in PARALLEL.
+      // Within the 25s, askWithFallback can fit 2 primary attempts (~10s) + 1-2 fallback attempts (~10s).
+      const PER_AI_DEBATE_TIMEOUT = 25000;
+
+      function debatePromise(name, askFn, primaryModel, key, providerKey) {
+        return withTimeout(
+          askWithFallback(askFn, fullPrompt, primaryModel, convHistory, key, r1System, DEBATE_MAX_TOKENS, providerKey),
+          PER_AI_DEBATE_TIMEOUT, name
+        ).then(
+          result => {
+            if (wantsStream) sendEvent('model_done', { model: name, round: 1, usedFallback: result.usedFallback });
+            return { name, text: result.text, ok: true, usedFallback: result.usedFallback };
+          },
+          e => {
+            if (wantsStream) sendEvent('model_failed', { model: name, round: 1, error: e?.message });
+            return { name, ok: false, error: e?.message || 'failed' };
+          }
+        );
+      }
+
       const r1Promises = [
-        withTimeout(claudeAsk(fullPrompt, models.claude, convHistory, KEYS.anthropic, r1System), 30000, 'Claude').then(
-          v => { if (wantsStream) sendEvent('model_done', { model: 'Claude', round: 1 }); return { name: 'Claude', text: v, ok: true }; },
-          e => { if (wantsStream) sendEvent('model_failed', { model: 'Claude', round: 1, error: e?.message }); return { name: 'Claude', ok: false, error: e?.message || 'failed' }; }
-        ),
-        withTimeout(openaiAsk(fullPrompt, models.openai, convHistory, KEYS.openai, r1System), 30000, 'ChatGPT').then(
-          v => { if (wantsStream) sendEvent('model_done', { model: 'ChatGPT', round: 1 }); return { name: 'ChatGPT', text: v, ok: true }; },
-          e => { if (wantsStream) sendEvent('model_failed', { model: 'ChatGPT', round: 1, error: e?.message }); return { name: 'ChatGPT', ok: false, error: e?.message || 'failed' }; }
-        ),
-        withTimeout(geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, r1System), 30000, 'Gemini').then(
-          v => { if (wantsStream) sendEvent('model_done', { model: 'Gemini', round: 1 }); return { name: 'Gemini', text: v, ok: true }; },
-          e => { if (wantsStream) sendEvent('model_failed', { model: 'Gemini', round: 1, error: e?.message }); return { name: 'Gemini', ok: false, error: e?.message || 'failed' }; }
-        ),
-        withTimeout(callGrokRetry(fullPrompt, models.grok, convHistory, KEYS.grok, r1System), 28000, 'Grok').then(
-          v => { if (wantsStream) sendEvent('model_done', { model: 'Grok', round: 1 }); return { name: 'Grok', text: v, ok: true }; },
-          e => { if (wantsStream) sendEvent('model_failed', { model: 'Grok', round: 1, error: e?.message }); return { name: 'Grok', ok: false, error: e?.message || 'failed' }; }
-        ),
+        debatePromise('Claude', claudeAsk, models.claude, KEYS.anthropic, 'claude'),
+        debatePromise('ChatGPT', openaiAsk, models.openai, KEYS.openai, 'openai'),
+        debatePromise('Gemini', geminiAsk, models.gemini, KEYS.gemini, 'gemini'),
+        debatePromise('Grok', grokAsk, models.grok, KEYS.grok, 'grok'),
       ];
 
       const round1Results = await Promise.all(r1Promises);
@@ -937,16 +991,19 @@ export default async function handler(req, res) {
       // Only participants who succeeded in round 1 can write rebuttals
       const r2Promises = round1Success.map(participant => {
         const rebuttalPrompt = buildRebuttalContext(participant.name, round1Success);
-        let caller, model, key;
-        if (participant.name === 'Claude')      { caller = claudeAsk;       model = models.claude; key = KEYS.anthropic; }
-        else if (participant.name === 'ChatGPT'){ caller = openaiAsk;       model = models.openai; key = KEYS.openai; }
-        else if (participant.name === 'Gemini') { caller = geminiAsk;       model = models.gemini; key = KEYS.gemini; }
-        else if (participant.name === 'Grok')   { caller = callGrokRetry;   model = models.grok;   key = KEYS.grok; }
+        let askFn, primaryModel, key, providerKey;
+        if (participant.name === 'Claude')      { askFn = claudeAsk; primaryModel = models.claude; key = KEYS.anthropic; providerKey = 'claude'; }
+        else if (participant.name === 'ChatGPT'){ askFn = openaiAsk; primaryModel = models.openai; key = KEYS.openai; providerKey = 'openai'; }
+        else if (participant.name === 'Gemini') { askFn = geminiAsk; primaryModel = models.gemini; key = KEYS.gemini; providerKey = 'gemini'; }
+        else if (participant.name === 'Grok')   { askFn = grokAsk;   primaryModel = models.grok;   key = KEYS.grok;   providerKey = 'grok';   }
 
-        return withTimeout(caller(rebuttalPrompt, model, [], key, r2System), 30000, participant.name + ' rebuttal').then(
-          v => {
-            if (wantsStream) sendEvent('model_done', { model: participant.name, round: 2 });
-            return { name: participant.name, text: v, ok: true };
+        return withTimeout(
+          askWithFallback(askFn, rebuttalPrompt, primaryModel, [], key, r2System, DEBATE_MAX_TOKENS, providerKey),
+          PER_AI_DEBATE_TIMEOUT, participant.name + ' rebuttal'
+        ).then(
+          result => {
+            if (wantsStream) sendEvent('model_done', { model: participant.name, round: 2, usedFallback: result.usedFallback });
+            return { name: participant.name, text: result.text, ok: true, usedFallback: result.usedFallback };
           },
           e => {
             if (wantsStream) sendEvent('model_failed', { model: participant.name, round: 2, error: e?.message });
