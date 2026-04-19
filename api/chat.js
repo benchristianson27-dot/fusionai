@@ -849,8 +849,76 @@ export default async function handler(req, res) {
   //   "1. Step one"          becomes  "Step one"
   // This preserves streaming UX because we emit cleaned lines as soon as they
   // complete (i.e., when a newline arrives).
+  // ── Bullet-to-prose coalescing stream filter ──
+  // The synthesis model (and Claude Haiku generally) produces bulleted lists
+  // for definitional questions despite strong anti-bullet prompting.
+  // This filter transforms:
+  //   * Item A
+  //   * Item B
+  //   * Item C
+  // into flowing prose:
+  //   Item A; Item B; Item C.
+  //
+  // Algorithm: buffer lines as they arrive. When we see a bulleted line, hold it.
+  // Keep holding while subsequent lines are bullets (or blank lines between them).
+  // When a non-bullet non-blank line arrives (or stream ends), flush the accumulated
+  // bullets as a single prose sentence, joined with "; " and capped with ".".
+  //
+  // The streaming UX cost: bulleted sections appear as a block, not character-by-
+  // character. Non-bulleted prose streams normally. Tradeoff is acceptable — users
+  // much prefer clean prose over bulleted walls.
   function makeBulletStripper() {
-    let buffer = '';
+    let buffer = '';          // incoming text buffer, split on newlines
+    let pendingBullets = [];  // accumulated bullet content, waiting for flush
+    const BULLET_RE = /^([-*•]|\d+[.)])\s+(.*)$/;
+
+    // Turn accumulated bullet items into a prose sentence.
+    function coalesce(items) {
+      if (items.length === 0) return '';
+      // Clean trailing punctuation on items so joining reads cleanly
+      const cleaned = items.map(s => s.replace(/[.;,]+$/, '').trim()).filter(Boolean);
+      if (cleaned.length === 0) return '';
+      if (cleaned.length === 1) {
+        // Single bullet → just the content as a sentence
+        return cleaned[0] + (cleaned[0].match(/[.!?]$/) ? '' : '.');
+      }
+      // Multiple bullets → join with "; " and cap with "."
+      return cleaned.join('; ') + '.';
+    }
+
+    // Process a single completed line. Returns output text to emit now,
+    // or empty string if the line was held back as a pending bullet.
+    function processLine(line) {
+      const trimmed = line.trim();
+      const bulletMatch = trimmed.match(BULLET_RE);
+
+      if (bulletMatch) {
+        // This line is a bullet — accumulate it, emit nothing yet
+        const content = bulletMatch[2].trim();
+        if (content) pendingBullets.push(content);
+        return '';
+      }
+
+      if (trimmed === '') {
+        // Blank line. If we have pending bullets, this might be separator inside
+        // a bulleted list — hold it, don't flush yet.
+        if (pendingBullets.length > 0) return '';
+        // Otherwise, pass through blank line normally
+        return '\n';
+      }
+
+      // Non-bullet, non-blank line. If we have pending bullets, flush them FIRST
+      // as prose, then emit this line.
+      if (pendingBullets.length > 0) {
+        const prose = coalesce(pendingBullets);
+        pendingBullets = [];
+        return prose + '\n\n' + line + '\n';
+      }
+
+      // Normal prose line — pass through
+      return line + '\n';
+    }
+
     return {
       push(delta) {
         buffer += delta;
@@ -859,31 +927,32 @@ export default async function handler(req, res) {
         while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
           const line = buffer.slice(0, newlineIdx);
           buffer = buffer.slice(newlineIdx + 1);
-          output += stripBullet(line) + '\n';
+          output += processLine(line);
         }
         return output;
       },
-      // Drain remaining buffered content (call at end of stream)
       flush() {
-        const out = stripBullet(buffer);
-        buffer = '';
-        return out;
+        // Process any remaining buffered content as a final line (no trailing newline)
+        let output = '';
+        if (buffer.length > 0) {
+          output += processLine(buffer);
+          buffer = '';
+        }
+        // Flush any still-pending bullets as coalesced prose
+        if (pendingBullets.length > 0) {
+          output += coalesce(pendingBullets);
+          pendingBullets = [];
+        }
+        return output;
       }
     };
-    // Strip a leading bullet marker from a single line.
-    // Only strips the marker itself — preserves the line's content.
-    function stripBullet(line) {
-      // Preserve indentation whitespace for code blocks — only strip on lines that look like prose bullets
-      const trimmed = line.trimStart();
-      const leadingWs = line.slice(0, line.length - trimmed.length);
-      // Bullet patterns: -, *, •, and numbered "1. " "2) " etc.
-      const bulletPattern = /^([-*•]|\d+[.)])\s+/;
-      const match = trimmed.match(bulletPattern);
-      if (!match) return line;
-      // Don't strip if inside what looks like a code block context (double-indented)
-      // This is a rough heuristic — for cleaner answers a proper markdown parser would help
-      return leadingWs + trimmed.slice(match[0].length);
-    }
+  }
+
+  // One-shot coalescer: takes a full text string and runs the same bullet-to-prose
+  // transformation. Used to clean the final `reply` stored in done events.
+  function coalesceBullets(text) {
+    const stripper = makeBulletStripper();
+    return stripper.push(text) + stripper.flush();
   }
 
   function buildSynthInstruction(successfulCount) {
@@ -980,13 +1049,34 @@ export default async function handler(req, res) {
     if (complexity === 'simple') {
       if (wantsStream) {
         sendEvent('complexity', { complexity, models: ['Claude'] });
+        // Mark the 3 non-running AIs as "not needed" so their Workstation cards
+        // don't hang on "Thinking" — simple questions only need 1 model.
+        sendEvent('individual_not_needed', { model: 'ChatGPT' });
+        sendEvent('individual_not_needed', { model: 'Gemini' });
+        sendEvent('individual_not_needed', { model: 'Grok' });
+        // Claude's card should fill live, and the main chat answer is the same text
+        sendEvent('individual_start', { model: 'Claude' });
         try {
           let acc = '';
+          const stripper = makeBulletStripper();
           for await (const delta of streamClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)) {
             acc += delta;
-            sendEvent('delta', { text: delta });
+            // Strip bullets from both Workstation card AND main chat delta
+            const cleaned = stripper.push(delta);
+            if (cleaned) {
+              sendEvent('individual_delta', { model: 'Claude', text: cleaned });
+              sendEvent('delta', { text: cleaned });
+            }
           }
-          sendEvent('done', { reply: acc, synthesized: false, models: ['Claude'], failed: [], complexity });
+          const tail = stripper.flush();
+          if (tail) {
+            sendEvent('individual_delta', { model: 'Claude', text: tail });
+            sendEvent('delta', { text: tail });
+          }
+          // Send individual_done so Claude's card finalizes with full text
+          const cleanedFull = coalesceBullets(acc);
+          sendEvent('individual_done', { model: 'Claude', text: cleanedFull });
+          sendEvent('done', { reply: cleanedFull, synthesized: false, models: ['Claude'], failed: [], complexity });
           res.end();
           return;
         } catch (e) {
@@ -1120,7 +1210,7 @@ export default async function handler(req, res) {
           const tail = stripper.flush();
           if (tail) sendEvent('delta', { text: tail });
           sendEvent('done', {
-            reply: acc.replace(/^([ \t]*)([-*•]|\d+[.)])\s+/gm, '$1'),
+            reply: coalesceBullets(acc),
             synthesized: true,
             models: successful.map(s => s.name),
             failed: failed.concat(skipped).map(f => f.name),
@@ -1495,7 +1585,7 @@ export default async function handler(req, res) {
         // Flush any remaining buffered content (final line without trailing newline)
         const tail = stripper.flush();
         if (tail) sendEvent('delta', { text: tail });
-        sendEvent('done', { reply: acc.replace(/^([ \t]*)([-*•]|\d+[.)])\s+/gm, '$1'), synthesized: true, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity, individual: successful });
+        sendEvent('done', { reply: coalesceBullets(acc), synthesized: true, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity, individual: successful });
         res.end();
         return;
       } catch (e) {
