@@ -825,10 +825,17 @@ export default async function handler(req, res) {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering if present
     res.flushHeaders?.();
+    // Send a 2KB padding comment to defeat proxy-level buffering.
+    // Many reverse proxies won't flush the first response chunk until they've seen
+    // a certain amount of data. This primes the pipe so subsequent events flow freely.
+    res.write(': ' + ' '.repeat(2048) + '\n\n');
+    if (typeof res.flush === 'function') { try { res.flush(); } catch(e) {} }
   }
 
   function sendEvent(type, data) {
     res.write('data: ' + JSON.stringify({ type, ...data }) + '\n\n');
+    // Flush immediately so the browser sees events in real-time.
+    if (typeof res.flush === 'function') { try { res.flush(); } catch(e) {} }
   }
 
   // ── Build synthesis instruction (shared between medium and complex) ──
@@ -1300,11 +1307,17 @@ export default async function handler(req, res) {
 
     // Build the promises — each runs its stream and returns when the stream completes.
     // WIN #3: Grok gets tighter timeout because it's typically the slowest.
+    //
+    // IMPORTANT: web search is DISABLED for individual streaming calls. When a model uses
+    // web search, it spends 10-15s searching before any text tokens flow — making the
+    // Workstation cards appear frozen on "Thinking" for most of the query. The synthesizer
+    // Claude still has search capability, so search-enabled answers still get results.
+    const INDIVIDUAL_USE_SEARCH = false;
     const streamPromises = [
-      withTimeout(runStreamForModel('Claude',  () => streamClaude (fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)), 25000, 'Claude'),
-      withTimeout(runStreamForModel('ChatGPT', () => streamOpenAI (fullPrompt, models.openai, convHistory, KEYS.openai,    systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)), 25000, 'ChatGPT'),
-      withTimeout(runStreamForModel('Gemini',  () => streamGemini (fullPrompt, models.gemini, convHistory, KEYS.gemini,    systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)), 25000, 'Gemini'),
-      withTimeout(runStreamForModel('Grok',    () => streamGrok   (fullPrompt, models.grok,   convHistory, KEYS.grok,      systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)), 20000, 'Grok'),
+      withTimeout(runStreamForModel('Claude',  () => streamClaude (fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 30000, 'Claude'),
+      withTimeout(runStreamForModel('ChatGPT', () => streamOpenAI (fullPrompt, models.openai, convHistory, KEYS.openai,    systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 25000, 'ChatGPT'),
+      withTimeout(runStreamForModel('Gemini',  () => streamGemini (fullPrompt, models.gemini, convHistory, KEYS.gemini,    systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 25000, 'Gemini'),
+      withTimeout(runStreamForModel('Grok',    () => streamGrok   (fullPrompt, models.grok,   convHistory, KEYS.grok,      systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 22000, 'Grok'),
     ];
 
     const wrapped = streamPromises.map((p, i) =>
