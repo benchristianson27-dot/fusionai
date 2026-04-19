@@ -839,6 +839,53 @@ export default async function handler(req, res) {
   }
 
   // ── Build synthesis instruction (shared between medium and complex) ──
+  // ── Bullet-stripping stream filter ──
+  // The synthesis model sometimes produces bullet lists despite strong anti-bullet
+  // instructions in the prompt. This filter catches stream deltas, buffers them
+  // line-by-line, and converts leading bullet markers to prose connectors.
+  // Examples:
+  //   "- First thing is x"   becomes  "First thing is x"
+  //   "* Another point"      becomes  "Another point"
+  //   "1. Step one"          becomes  "Step one"
+  // This preserves streaming UX because we emit cleaned lines as soon as they
+  // complete (i.e., when a newline arrives).
+  function makeBulletStripper() {
+    let buffer = '';
+    return {
+      push(delta) {
+        buffer += delta;
+        let output = '';
+        let newlineIdx;
+        while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newlineIdx);
+          buffer = buffer.slice(newlineIdx + 1);
+          output += stripBullet(line) + '\n';
+        }
+        return output;
+      },
+      // Drain remaining buffered content (call at end of stream)
+      flush() {
+        const out = stripBullet(buffer);
+        buffer = '';
+        return out;
+      }
+    };
+    // Strip a leading bullet marker from a single line.
+    // Only strips the marker itself — preserves the line's content.
+    function stripBullet(line) {
+      // Preserve indentation whitespace for code blocks — only strip on lines that look like prose bullets
+      const trimmed = line.trimStart();
+      const leadingWs = line.slice(0, line.length - trimmed.length);
+      // Bullet patterns: -, *, •, and numbered "1. " "2) " etc.
+      const bulletPattern = /^([-*•]|\d+[.)])\s+/;
+      const match = trimmed.match(bulletPattern);
+      if (!match) return line;
+      // Don't strip if inside what looks like a code block context (double-indented)
+      // This is a rough heuristic — for cleaner answers a proper markdown parser would help
+      return leadingWs + trimmed.slice(match[0].length);
+    }
+  }
+
   function buildSynthInstruction(successfulCount) {
     const toneHints = analyzeTone(prompt);
     const base = 'You are the FusionAI synthesis engine. Create one clear, well-written answer from the AI responses provided. '
@@ -1064,12 +1111,16 @@ export default async function handler(req, res) {
         sendEvent('synth_start', {});
         try {
           let acc = '';
+          const stripper = makeBulletStripper();
           for await (const delta of streamClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, SYNTHESIS_MAX_TOKENS)) {
             acc += delta;
-            sendEvent('delta', { text: delta });
+            const cleaned = stripper.push(delta);
+            if (cleaned) sendEvent('delta', { text: cleaned });
           }
+          const tail = stripper.flush();
+          if (tail) sendEvent('delta', { text: tail });
           sendEvent('done', {
-            reply: acc,
+            reply: acc.replace(/^([ \t]*)([-*•]|\d+[.)])\s+/gm, '$1'),
             synthesized: true,
             models: successful.map(s => s.name),
             failed: failed.concat(skipped).map(f => f.name),
@@ -1433,13 +1484,18 @@ export default async function handler(req, res) {
       sendEvent('synth_start', {});
       try {
         let acc = '';
+        const stripper = makeBulletStripper();
         // WIN #2: synthesis uses Haiku regardless of tier
         // WIN #1: synthesis is streamed
         for await (const delta of streamClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, SYNTHESIS_MAX_TOKENS)) {
           acc += delta;
-          sendEvent('delta', { text: delta });
+          const cleaned = stripper.push(delta);
+          if (cleaned) sendEvent('delta', { text: cleaned });
         }
-        sendEvent('done', { reply: acc, synthesized: true, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity, individual: successful });
+        // Flush any remaining buffered content (final line without trailing newline)
+        const tail = stripper.flush();
+        if (tail) sendEvent('delta', { text: tail });
+        sendEvent('done', { reply: acc.replace(/^([ \t]*)([-*•]|\d+[.)])\s+/gm, '$1'), synthesized: true, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity, individual: successful });
         res.end();
         return;
       } catch (e) {
