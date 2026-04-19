@@ -66,7 +66,20 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
   }
 
   if (activeMode === 'thinking') sys += ' THINKING MODE: Show your reasoning step by step.';
-  if (activeMode === 'search') sys += ' SEARCH MODE: Prioritize current information.';
+
+  // Web search instruction: the tool is always available. Model decides when to use it.
+  // In Search mode, bias strongly toward searching for anything that could benefit from current info.
+  if (activeMode === 'search') {
+    sys += ' SEARCH MODE ACTIVE: The user has explicitly requested you use web search. '
+        + 'Strongly prefer invoking your web_search tool for this query, even if you think you might know the answer from training. '
+        + 'Always cite current sources when possible.';
+  } else {
+    sys += ' You have a web_search tool available. Use it WHENEVER the query involves: '
+        + 'current events, recent news, living people\'s current roles/status, stock prices, sports scores, '
+        + 'product releases, laws/regulations that may have changed, "today/now/current/latest" mentions, '
+        + 'or anything where your training data might be out of date. Do NOT search for stable historical facts, math, '
+        + 'or general knowledge. When you do search, cite specific sources.';
+  }
 
   // ── Unhedged directive ──
   // FusionAI users expect direct answers on topics other AIs over-hedge.
@@ -199,10 +212,10 @@ export default async function handler(req, res) {
   const SYNTH_MODEL = 'claude-haiku-4-5-20251001';
 
   const TIER_MODELS = {
-    free: { claude: 'claude-haiku-4-5-20251001', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash', grok: 'grok-3-mini' },
-    starter: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash', grok: 'grok-3-mini' },
-    pro: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.5-flash', grok: 'grok-3' },
-    enterprise: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.5-flash', grok: 'grok-3' },
+    free: { claude: 'claude-haiku-4-5-20251001', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash', grok: 'grok-4-1-fast-non-reasoning' },
+    starter: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash', grok: 'grok-4-1-fast-non-reasoning' },
+    pro: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.5-flash', grok: 'grok-4-1-fast' },
+    enterprise: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.5-flash', grok: 'grok-4-1-fast' },
   };
 
   const models = TIER_MODELS[tier] || TIER_MODELS.free;
@@ -225,6 +238,23 @@ export default async function handler(req, res) {
   // Synthesis gets 2000 (slightly more room since it's the final answer)
   const INDIVIDUAL_MAX_TOKENS = 1500;
   const SYNTHESIS_MAX_TOKENS = 2000;
+
+  // ── Web search configuration ──
+  // Tool is always ATTACHED; each model decides autonomously whether to USE it.
+  // When user enables Search mode, system prompt strongly prefers searching.
+  const WEB_SEARCH_ENABLED = true; // always offer the capability
+  const CLAUDE_WEB_SEARCH_TOOL = { type: 'web_search_20250305', name: 'web_search', max_uses: 3 };
+  const OPENAI_WEB_SEARCH_TOOL = { type: 'web_search_preview' };
+  const GEMINI_WEB_SEARCH_TOOL = { google_search: {} };
+
+  // Collect search metadata for SSE emission. Each entry: {model, query, urls}.
+  const searchesMade = [];
+  function recordSearch(modelName, query, urls) {
+    searchesMade.push({ model: modelName, query: query || '', urls: urls || [] });
+    if (wantsStream) {
+      sendEvent('search_performed', { model: modelName, query: query || '', urls: (urls || []).slice(0, 3) });
+    }
+  }
 
   function withTimeout(promise, ms, name) {
     return Promise.race([
@@ -263,76 +293,258 @@ export default async function handler(req, res) {
     return parts;
   }
 
+  // ── Wrappers that pass useWebSearch=true (always on), record any searches to SSE,
+  // and return just the text string (matching the legacy API). Callers that need
+  // the search metadata can use the *_full variants below.
+  async function claudeAsk(p, model, hist, key, sys) {
+    const r = await callClaude(p, model, hist, key, sys, WEB_SEARCH_ENABLED);
+    if (r.searched) recordSearch('claude', '', r.sources);
+    return r.text;
+  }
+  async function openaiAsk(p, model, hist, key, sys) {
+    const r = await callOpenAI(p, model, hist, key, sys, WEB_SEARCH_ENABLED);
+    if (r.searched) recordSearch('chatgpt', '', r.sources);
+    return r.text;
+  }
+  async function geminiAsk(p, model, hist, key, sys) {
+    const r = await callGemini(p, model, hist, key, sys, WEB_SEARCH_ENABLED);
+    if (r.searched) recordSearch('gemini', '', r.sources);
+    return r.text;
+  }
+  async function grokAsk(p, model, hist, key, sys) {
+    const r = await callGrok(p, model, hist, key, sys, WEB_SEARCH_ENABLED);
+    if (r.searched) recordSearch('grok', '', r.sources);
+    return r.text;
+  }
+
   // ── Non-streaming callers (for the initial four queries) ──
-  async function callClaude(p, model, hist, key, sys) {
+  // Each caller accepts useWebSearch. When true, the provider's native web search tool is attached.
+  // Each returns an object: { text: string, searched: boolean, sources: string[] }
+
+  async function callClaude(p, model, hist, key, sys, useWebSearch) {
     if (!key) throw new Error('No key');
     const userContent = hasImages ? buildClaudeContent(p) : p;
     const messages = hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: userContent }]);
-    const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model, max_tokens: INDIVIDUAL_MAX_TOKENS, system: sys, messages }) });
+    const body = { model, max_tokens: INDIVIDUAL_MAX_TOKENS, system: sys, messages };
+    if (useWebSearch) {
+      body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }];
+    }
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify(body),
+    });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Claude error ' + r.status); }
-    return (await r.json()).content?.[0]?.text || '';
+    const data = await r.json();
+    // Response content can be multiple blocks: server_tool_use / web_search_tool_result / text.
+    // We collect all text blocks, in order, and note whether any search was performed.
+    const blocks = data.content || [];
+    let text = '';
+    let searched = false;
+    const sources = [];
+    for (const block of blocks) {
+      if (block.type === 'text') text += block.text;
+      else if (block.type === 'server_tool_use' && block.name === 'web_search') searched = true;
+      else if (block.type === 'web_search_tool_result') {
+        searched = true;
+        const results = block.content || [];
+        for (const r of results) {
+          if (r.url) sources.push(r.url);
+        }
+      }
+    }
+    return { text: text || '', searched, sources: sources.slice(0, 10) };
   }
 
-  async function callOpenAI(p, model, hist, key, sys) {
+  async function callOpenAI(p, model, hist, key, sys, useWebSearch) {
     if (!key) throw new Error('No key');
     const userContent = hasImages ? buildOpenAIContent(p) : p;
     const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
-    const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: INDIVIDUAL_MAX_TOKENS, messages }) });
+
+    // OpenAI has two paths. Their "web_search_preview" tool requires the Responses API
+    // (POST /v1/responses) on models like gpt-4o-search-preview, OR the classic Chat Completions
+    // path with the gpt-4o models. For compatibility with our existing model tiers (4o-mini, 4o)
+    // we keep the Chat Completions endpoint. If useWebSearch is requested, we switch to the
+    // Responses endpoint with the web_search_preview tool. Otherwise standard Chat Completions.
+    if (useWebSearch) {
+      // Build Responses API input — different shape than Chat Completions
+      const input = messages.map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content : m.content }));
+      const body = {
+        model,
+        input,
+        tools: [{ type: 'web_search_preview' }],
+        max_output_tokens: INDIVIDUAL_MAX_TOKENS,
+      };
+      const r = await fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI error ' + r.status); }
+      const data = await r.json();
+      // Responses API returns `output` array containing text + tool_call items
+      let text = '';
+      let searched = false;
+      const sources = [];
+      for (const item of (data.output || [])) {
+        if (item.type === 'message' && item.content) {
+          for (const c of item.content) {
+            if (c.type === 'output_text') text += c.text || '';
+            if (c.type === 'text') text += c.text || '';
+            // Annotations contain web search citations
+            if (c.annotations) {
+              for (const a of c.annotations) {
+                if (a.type === 'url_citation' && a.url) sources.push(a.url);
+              }
+            }
+          }
+        } else if (item.type === 'web_search_call') {
+          searched = true;
+        }
+      }
+      // Fallback: some shapes use .output_text directly
+      if (!text && data.output_text) text = data.output_text;
+      return { text: text || '', searched, sources: sources.slice(0, 10) };
+    }
+
+    // Standard Chat Completions path (no search)
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({ model, max_tokens: INDIVIDUAL_MAX_TOKENS, messages }),
+    });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI error ' + r.status); }
-    return (await r.json()).choices?.[0]?.message?.content || '';
+    const data = await r.json();
+    return { text: data.choices?.[0]?.message?.content || '', searched: false, sources: [] };
   }
 
-  async function callGemini(p, model, hist, key, sys) {
+  async function callGemini(p, model, hist, key, sys, useWebSearch) {
     if (!key) throw new Error('No key');
-    // Gemini uses a 'contents' array of {role, parts} where role is 'user' or 'model'.
-    // Map the conversation history into that format so Gemini has context.
     const contents = [];
     (hist || []).forEach(m => {
       const role = (m.role === 'assistant') ? 'model' : 'user';
       contents.push({ role, parts: [{ text: m.content }] });
     });
-    // Final user message — with images attached if present
     const finalParts = hasImages ? buildGeminiParts(p) : [{ text: p }];
     contents.push({ role: 'user', parts: finalParts });
+
+    const body = {
+      contents,
+      systemInstruction: { parts: [{ text: sys }] },
+      generationConfig: { maxOutputTokens: INDIVIDUAL_MAX_TOKENS },
+    };
+    if (useWebSearch) {
+      // Google Search grounding — dedicated tool for Gemini 2.x
+      body.tools = [{ google_search: {} }];
+    }
+
     const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents,
-        systemInstruction: { parts: [{ text: sys }] },  // Gemini's dedicated system-instruction slot
-        generationConfig: { maxOutputTokens: INDIVIDUAL_MAX_TOKENS }
-      })
+      body: JSON.stringify(body),
     });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Gemini error ' + r.status); }
-    return (await r.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const data = await r.json();
+    const candidate = data.candidates?.[0];
+    let text = '';
+    for (const part of (candidate?.content?.parts || [])) {
+      if (part.text) text += part.text;
+    }
+    // Grounding metadata tells us whether search was used
+    const gm = candidate?.groundingMetadata;
+    const searched = !!(gm && (gm.webSearchQueries?.length || gm.groundingChunks?.length));
+    const sources = [];
+    if (gm?.groundingChunks) {
+      for (const chunk of gm.groundingChunks) {
+        if (chunk.web?.uri) sources.push(chunk.web.uri);
+      }
+    }
+    return { text: text || '', searched, sources: sources.slice(0, 10) };
   }
 
-  async function callGrok(p, model, hist, key, sys) {
+  async function callGrok(p, model, hist, key, sys, useWebSearch) {
     if (!key) throw new Error('No key');
     const userContent = hasImages ? buildOpenAIContent(p) : p;
     const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
-    // No retry — if Grok 5xx's, let it fail fast rather than blocking 2 extra seconds
-    const r = await fetch('https://api.x.ai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, body: JSON.stringify({ model, max_tokens: INDIVIDUAL_MAX_TOKENS, messages }) });
+
+    if (useWebSearch) {
+      // xAI Responses API with web_search tool — endpoint is /v1/responses
+      // Input format: a flat array of { role, content } items
+      const input = messages.map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }));
+      const body = {
+        model,
+        input,
+        tools: [{ type: 'web_search' }],
+      };
+      const r = await fetch('https://api.x.ai/v1/responses', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error('Grok error ' + r.status);
+      const data = await r.json();
+      // Parse output array (same structure as OpenAI Responses API)
+      let text = '';
+      let searched = false;
+      const sources = [];
+      for (const item of (data.output || [])) {
+        if (item.type === 'message' && item.content) {
+          for (const c of item.content) {
+            if (c.type === 'output_text' || c.type === 'text') text += c.text || '';
+            if (c.annotations) {
+              for (const a of c.annotations) {
+                if (a.url) sources.push(a.url);
+              }
+            }
+          }
+        } else if (item.type === 'web_search_call' || item.type === 'web_search') {
+          searched = true;
+        }
+      }
+      if (!text && data.output_text) text = data.output_text;
+      return { text: text || '', searched, sources: sources.slice(0, 10) };
+    }
+
+    // Standard Grok without search — Chat Completions endpoint
+    const r = await fetch('https://api.x.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({ model, max_tokens: INDIVIDUAL_MAX_TOKENS, messages }),
+    });
     if (!r.ok) throw new Error('Grok error ' + r.status);
-    return (await r.json()).choices?.[0]?.message?.content || '';
+    const data = await r.json();
+    return { text: data.choices?.[0]?.message?.content || '', searched: false, sources: [] };
   }
 
   // ── Streaming Claude caller for synthesis ──
   // Yields incremental text deltas via async iterator.
-  async function* streamClaude(p, model, hist, key, sys, maxTokens) {
+  // When useWebSearch is true, the web_search tool is attached. Search metadata
+  // is emitted as SSE events (search_performed) at the moment Claude performs a search.
+  async function* streamClaude(p, model, hist, key, sys, maxTokens, useWebSearch) {
     if (!key) throw new Error('No key');
     const userContent = hasImages ? buildClaudeContent(p) : p;
     const messages = hist.map(m => ({ role: m.role, content: m.content })).concat([{ role: 'user', content: userContent }]);
+    const body = { model, max_tokens: maxTokens, system: sys, messages, stream: true };
+    if (useWebSearch) {
+      body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }];
+    }
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model, max_tokens: maxTokens, system: sys, messages, stream: true })
+      body: JSON.stringify(body),
     });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Claude stream error ' + r.status); }
 
     const reader = r.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+
+    // Tracks per-block type so we can differentiate text blocks from search result blocks
+    // Claude streams events in order: content_block_start (with block metadata) → content_block_delta* → content_block_stop
+    // For search: block.type === 'server_tool_use' or 'web_search_tool_result'
+    // For text: block.type === 'text'
+    let currentBlockType = null;
+    let currentSearchSources = [];
 
     try {
       while (true) {
@@ -347,8 +559,27 @@ export default async function handler(req, res) {
           if (!data || data === '[DONE]') continue;
           try {
             const parsed = JSON.parse(data);
-            if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'text_delta') {
-              yield parsed.delta.text;
+            if (parsed.type === 'content_block_start') {
+              currentBlockType = parsed.content_block?.type || null;
+              // If this is a search result block, extract URLs from it
+              if (currentBlockType === 'web_search_tool_result') {
+                const results = parsed.content_block?.content || [];
+                for (const r of results) {
+                  if (r.url) currentSearchSources.push(r.url);
+                }
+                // Emit search_performed event on-the-fly
+                recordSearch('claude-synth', '', currentSearchSources.slice(-5));
+              } else if (currentBlockType === 'server_tool_use') {
+                // The search is about to happen — we don't have URLs yet, just mark that search is in flight
+                recordSearch('claude-synth', parsed.content_block?.input?.query || '', []);
+              }
+            } else if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'text_delta') {
+              // Only yield text deltas from actual text blocks (not tool-use blocks)
+              if (currentBlockType === 'text' || currentBlockType == null) {
+                yield parsed.delta.text;
+              }
+            } else if (parsed.type === 'content_block_stop') {
+              currentBlockType = null;
             }
           } catch { /* skip malformed chunks */ }
         }
@@ -437,7 +668,7 @@ export default async function handler(req, res) {
         sendEvent('complexity', { complexity, models: ['Claude'] });
         try {
           let acc = '';
-          for await (const delta of streamClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS)) {
+          for await (const delta of streamClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)) {
             acc += delta;
             sendEvent('delta', { text: delta });
           }
@@ -449,7 +680,7 @@ export default async function handler(req, res) {
             let acc = '';
             for await (const delta of (async function* () {
               // Fallback: non-streaming Gemini, simulated as a single chunk
-              const text = await callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt);
+              const text = await geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt);
               yield text;
             })()) {
               acc += delta;
@@ -467,11 +698,11 @@ export default async function handler(req, res) {
       } else {
         // Non-streaming fallback
         try {
-          finalReply = await withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
+          finalReply = await withTimeout(claudeAsk(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
           successful = [{ name: 'Claude', text: finalReply }];
         } catch (e) {
           try {
-            finalReply = await withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
+            finalReply = await withTimeout(geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
             successful = [{ name: 'Gemini', text: finalReply }];
           } catch (e2) {
             return res.status(500).json({ error: 'All models failed' });
@@ -486,8 +717,8 @@ export default async function handler(req, res) {
       if (wantsStream) sendEvent('complexity', { complexity, models: ['Claude', 'Gemini'] });
 
       // WIN #3: tighter timeouts (25s cap)
-      const claudeP = withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
-      const geminiP = withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
+      const claudeP = withTimeout(claudeAsk(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
+      const geminiP = withTimeout(geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
 
       const { allDone, results } = collectResults([claudeP, geminiP], ['Claude', 'Gemini']);
 
@@ -578,7 +809,7 @@ export default async function handler(req, res) {
 
       // Non-streaming fallback for medium
       try {
-        finalReply = await withTimeout(callClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 20000, 'Synthesis');
+        finalReply = await withTimeout(claudeAsk(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 20000, 'Synthesis');
         synthesized = true;
       } catch {
         finalReply = successful[0].text;
@@ -608,17 +839,17 @@ export default async function handler(req, res) {
       // Grok is the flakiest of the four — sometimes it returns HTTP 200 with empty content.
       async function callGrokRetry(p, model, hist, key, sys) {
         try {
-          const text = await callGrok(p, model, hist, key, sys);
+          const text = await grokAsk(p, model, hist, key, sys);
           if (text && text.trim()) return text;
           // Empty response - retry once
           await new Promise(r => setTimeout(r, 1200));
-          const text2 = await callGrok(p, model, hist, key, sys);
+          const text2 = await grokAsk(p, model, hist, key, sys);
           if (!text2 || !text2.trim()) throw new Error('Grok returned empty after retry');
           return text2;
         } catch (e) {
           // Error on first try - retry once
           await new Promise(r => setTimeout(r, 1200));
-          return await callGrok(p, model, hist, key, sys);
+          return await grokAsk(p, model, hist, key, sys);
         }
       }
 
@@ -630,15 +861,15 @@ export default async function handler(req, res) {
         + 'Other AIs will read your argument and respond, so make your strongest case.';
 
       const r1Promises = [
-        withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, r1System), 30000, 'Claude').then(
+        withTimeout(claudeAsk(fullPrompt, models.claude, convHistory, KEYS.anthropic, r1System), 30000, 'Claude').then(
           v => { if (wantsStream) sendEvent('model_done', { model: 'Claude', round: 1 }); return { name: 'Claude', text: v, ok: true }; },
           e => { if (wantsStream) sendEvent('model_failed', { model: 'Claude', round: 1, error: e?.message }); return { name: 'Claude', ok: false, error: e?.message || 'failed' }; }
         ),
-        withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, r1System), 30000, 'ChatGPT').then(
+        withTimeout(openaiAsk(fullPrompt, models.openai, convHistory, KEYS.openai, r1System), 30000, 'ChatGPT').then(
           v => { if (wantsStream) sendEvent('model_done', { model: 'ChatGPT', round: 1 }); return { name: 'ChatGPT', text: v, ok: true }; },
           e => { if (wantsStream) sendEvent('model_failed', { model: 'ChatGPT', round: 1, error: e?.message }); return { name: 'ChatGPT', ok: false, error: e?.message || 'failed' }; }
         ),
-        withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, r1System), 30000, 'Gemini').then(
+        withTimeout(geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, r1System), 30000, 'Gemini').then(
           v => { if (wantsStream) sendEvent('model_done', { model: 'Gemini', round: 1 }); return { name: 'Gemini', text: v, ok: true }; },
           e => { if (wantsStream) sendEvent('model_failed', { model: 'Gemini', round: 1, error: e?.message }); return { name: 'Gemini', ok: false, error: e?.message || 'failed' }; }
         ),
@@ -687,9 +918,9 @@ export default async function handler(req, res) {
       const r2Promises = round1Success.map(participant => {
         const rebuttalPrompt = buildRebuttalContext(participant.name, round1Success);
         let caller, model, key;
-        if (participant.name === 'Claude')      { caller = callClaude;      model = models.claude; key = KEYS.anthropic; }
-        else if (participant.name === 'ChatGPT'){ caller = callOpenAI;      model = models.openai; key = KEYS.openai; }
-        else if (participant.name === 'Gemini') { caller = callGemini;      model = models.gemini; key = KEYS.gemini; }
+        if (participant.name === 'Claude')      { caller = claudeAsk;       model = models.claude; key = KEYS.anthropic; }
+        else if (participant.name === 'ChatGPT'){ caller = openaiAsk;       model = models.openai; key = KEYS.openai; }
+        else if (participant.name === 'Gemini') { caller = geminiAsk;       model = models.gemini; key = KEYS.gemini; }
         else if (participant.name === 'Grok')   { caller = callGrokRetry;   model = models.grok;   key = KEYS.grok; }
 
         return withTimeout(caller(rebuttalPrompt, model, [], key, r2System), 30000, participant.name + ' rebuttal').then(
@@ -784,7 +1015,7 @@ export default async function handler(req, res) {
       // Non-streaming fallback for debate
       let verdictText = '';
       try {
-        verdictText = await withTimeout(callClaude(verdictPrompt, SYNTH_MODEL, [], KEYS.anthropic, verdictSystem), 25000, 'Verdict');
+        verdictText = await withTimeout(claudeAsk(verdictPrompt, SYNTH_MODEL, [], KEYS.anthropic, verdictSystem), 25000, 'Verdict');
       } catch (e) {
         verdictText = fullIndividual.map(p => '### ' + p.name + '\n\n' + p.text).join('\n\n---\n\n');
       }
@@ -805,10 +1036,10 @@ export default async function handler(req, res) {
     if (wantsStream) sendEvent('complexity', { complexity, models: ['Claude', 'ChatGPT', 'Gemini', 'Grok'] });
 
     // WIN #3: Grok gets tighter timeout because it's typically the slowest
-    const claudeP = withTimeout(callClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
-    const gptP = withTimeout(callOpenAI(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 25000, 'ChatGPT');
-    const geminiP = withTimeout(callGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
-    const grokP = withTimeout(callGrok(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 20000, 'Grok');
+    const claudeP = withTimeout(claudeAsk(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
+    const gptP = withTimeout(openaiAsk(fullPrompt, models.openai, convHistory, KEYS.openai, systemPrompt), 25000, 'ChatGPT');
+    const geminiP = withTimeout(geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
+    const grokP = withTimeout(grokAsk(fullPrompt, models.grok, convHistory, KEYS.grok, systemPrompt), 20000, 'Grok');
 
     // Track each result as it arrives
     const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
@@ -933,7 +1164,7 @@ export default async function handler(req, res) {
 
     // Non-streaming fallback for complex
     try {
-      finalReply = await withTimeout(callClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 25000, 'Synthesis');
+      finalReply = await withTimeout(claudeAsk(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 25000, 'Synthesis');
       synthesized = true;
     } catch {
       finalReply = successful[0].text;
