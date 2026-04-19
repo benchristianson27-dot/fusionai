@@ -981,21 +981,42 @@ export default async function handler(req, res) {
 
     // ── MEDIUM: 2 models (Claude + Gemini), synthesize via streaming ──
     if (complexity === 'medium') {
-      if (wantsStream) sendEvent('complexity', { complexity, models: ['Claude', 'Gemini'] });
+      if (wantsStream) {
+        sendEvent('complexity', { complexity, models: ['Claude', 'Gemini'] });
+        // Immediately mark ChatGPT and Grok as skipped so the Workstation cards
+        // don't hang on "Thinking" — this is a simple-enough query that only 2 models run.
+        sendEvent('individual_failed', { model: 'ChatGPT', error: 'Skipped — quick query only needs 2 models' });
+        sendEvent('individual_failed', { model: 'Grok', error: 'Skipped — quick query only needs 2 models' });
+      }
 
+      // Use streaming variants so the Workstation can show live text for each AI.
       // WIN #3: tighter timeouts (25s cap)
-      const claudeP = withTimeout(claudeAsk(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
-      const geminiP = withTimeout(geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
+      const INDIVIDUAL_USE_SEARCH_MEDIUM = false; // Search slows streaming; synth has search
+      const claudeStreamP = withTimeout(
+        runStreamForModel('Claude', () => streamClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH_MEDIUM)),
+        30000, 'Claude'
+      );
+      const geminiStreamP = withTimeout(
+        runStreamForModel('Gemini', () => streamGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH_MEDIUM)),
+        25000, 'Gemini'
+      );
 
-      const { allDone, results } = collectResults([claudeP, geminiP], ['Claude', 'Gemini']);
+      // Wait for both to complete (success or failure)
+      const mediumResults = await Promise.all([
+        claudeStreamP.then(r => r, err => ({ name: 'Claude', text: null, ok: false, error: err?.message || 'Failed' })),
+        geminiStreamP.then(r => r, err => ({ name: 'Gemini', text: null, ok: false, error: err?.message || 'Failed' })),
+      ]);
 
-      // WIN #6: If Claude returns quickly (<4s) with a solid answer, don't wait for Gemini
-      // Start a race: claudeP resolves fast → we can short-circuit.
-      // But easiest correct impl: wait for both (they run parallel), skip synthesis if only 1 back.
-      await allDone;
+      // Emit legacy model_done/model_failed for backward compat
+      if (wantsStream) {
+        mediumResults.forEach(r => {
+          if (r.ok) sendEvent('model_done', { model: r.name });
+          else sendEvent('model_failed', { model: r.name, error: r.error });
+        });
+      }
 
-      successful = results.successful;
-      failed = results.failed;
+      successful = mediumResults.filter(r => r.ok).map(r => ({ name: r.name, text: r.text }));
+      failed = mediumResults.filter(r => !r.ok).map(r => ({ name: r.name, error: r.error }));
 
       const skipped = [
         { name: 'ChatGPT', error: 'Skipped (quick query)' },
@@ -1343,30 +1364,29 @@ export default async function handler(req, res) {
       )
     );
 
-    // WIN #3 (race): resolve when we have 3 successes OR all 4 settled, whichever first
-    // Wait max 4s for 4th response after 3 are in
-    function successCount() { return collected.filter(c => c.ok).length; }
+    // All 4 AIs must settle (either done OR failed) before synthesis starts.
+    // This gives users complete visuals in the Workstation — they see every AI
+    // finish typing before the final answer begins streaming in the main chat.
+    // Safety: 26s hard ceiling in case a provider hangs. Individual stream timeouts
+    // (20-30s via withTimeout above) mean this is belt-and-suspenders.
     function allDone() { return settledFlags.every(f => f); }
 
     const startTime = Date.now();
-    const MAX_WAIT_AFTER_3 = 4000;
 
     await new Promise(resolve => {
       let resolved = false;
-      let raceTimer = null;
       function done() {
         if (resolved) return;
         resolved = true;
-        if (raceTimer) clearTimeout(raceTimer);
         resolve();
       }
       const checker = setInterval(() => {
         if (allDone()) { clearInterval(checker); done(); return; }
-        if (successCount() >= 3 && !raceTimer) {
-          raceTimer = setTimeout(() => { clearInterval(checker); done(); }, MAX_WAIT_AFTER_3);
-        }
-        if (Date.now() - startTime > 26000) { clearInterval(checker); done(); }
+        // Hard ceiling at 30s — past here, individual timeouts should have fired
+        // and marked any hanging streams as failed. Belt-and-suspenders.
+        if (Date.now() - startTime > 32000) { clearInterval(checker); done(); }
       }, 150);
+      // Also resolve naturally when all complete (catches the common case quickly)
       Promise.all(wrapped).then(() => { clearInterval(checker); done(); });
     });
 
