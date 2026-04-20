@@ -250,7 +250,7 @@ export default async function handler(req, res) {
   // Synthesis gets 2000 (slightly more room since it's the final answer)
   // Debate mode gets more (2500) so opening arguments and rebuttals never truncate mid-sentence
   const INDIVIDUAL_MAX_TOKENS = 1500;
-  const SYNTHESIS_MAX_TOKENS = 2000;
+  const SYNTHESIS_MAX_TOKENS = 3000;
   const DEBATE_MAX_TOKENS = 2500;
 
   // ── Fallback models: cheap/fast siblings that almost always work ──
@@ -782,18 +782,28 @@ export default async function handler(req, res) {
       try {
         const gen = streamGemini(p, model, hist, key, sys, maxTokens, useWebSearch);
         for await (const chunk of gen) {
-          emittedAny = true;
+          // Yield the chunk. We count non-empty chunks as "emitted output" so
+          // we can detect the empty-response case after the stream closes.
           yield chunk;
+          if (chunk && chunk.length > 0) emittedAny = true;
         }
-        // Primary (or fallback that succeeded) completed normally
-        return;
+        // Stream closed. If we emitted nothing real, Gemini gave an empty response —
+        // treat as failure and fall through to the next fallback model.
+        if (!emittedAny) {
+          lastErr = new Error('Empty response from ' + model);
+          if (i < chain.length - 1) continue;
+          // Chain exhausted below
+        } else {
+          // Got real output — we're done
+          return;
+        }
       } catch (e) {
         lastErr = e;
         if (emittedAny) {
           // Already streamed partial content — can't safely restart. Surface the error.
           throw e;
         }
-        // No output yet — safe to try the next model in the chain
+        // No real output yet — safe to try the next model in the chain
         if (i < chain.length - 1) continue;
       }
     }
@@ -1566,9 +1576,10 @@ export default async function handler(req, res) {
       }
       const checker = setInterval(() => {
         if (allDone()) { clearInterval(checker); done(); return; }
-        // Hard ceiling at 30s — past here, individual timeouts should have fired
-        // and marked any hanging streams as failed. Belt-and-suspenders.
-        if (Date.now() - startTime > 32000) { clearInterval(checker); done(); }
+        // Hard ceiling at 22s — past here, give up on slow individual streams
+        // so synthesis has time to complete before Vercel's 60s function timeout.
+        // Tradeoff: occasionally drop 1 AI to guarantee a complete synthesized answer.
+        if (Date.now() - startTime > 22000) { clearInterval(checker); done(); }
       }, 150);
       // Also resolve naturally when all complete (catches the common case quickly)
       Promise.all(wrapped).then(() => { clearInterval(checker); done(); });
@@ -1632,8 +1643,11 @@ export default async function handler(req, res) {
         res.end();
         return;
       } catch (e) {
+        // Synthesis failed mid-stream or at start. Flush any buffered content
+        // then REPLACE displayed content with the fallback (not append) so the
+        // user doesn't see a weird mix of partial synthesis + full AI text.
         const fallback = successful[0].text;
-        sendEvent('delta', { text: fallback });
+        sendEvent('delta', { text: fallback, replace: true });
         sendEvent('done', { reply: fallback, synthesized: false, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity, individual: successful });
         res.end();
         return;
