@@ -252,12 +252,14 @@ export default async function handler(req, res) {
 
   // ── Fallback models: cheap/fast siblings that almost always work ──
   // Used when the primary tier model fails all retries in debate mode.
-  // Same provider so the debate label stays honest ("Claude" stays "Claude").
+  // Fallback models — tried in order when the primary fails. Each is a DIFFERENT
+  // model from the primary so we're not just retrying the same thing.
+  // Gemini has a longer chain because it's been the most failure-prone provider.
   const FALLBACK_MODELS = {
-    claude: 'claude-haiku-4-5-20251001',
-    openai: 'gpt-4o-mini',
-    gemini: 'gemini-2.5-flash',
-    grok: 'grok-4-1-fast-non-reasoning',
+    claude: ['claude-haiku-4-5-20251001'],
+    openai: ['gpt-4o-mini'],
+    gemini: ['gemini-2.0-flash', 'gemini-1.5-flash'],
+    grok: ['grok-4-1-fast-non-reasoning'],
   };
 
   // ── Web search configuration ──
@@ -368,19 +370,24 @@ export default async function handler(req, res) {
       const text = await askWithRetry(askFn, p, primaryModel, hist, key, sys, maxTokens, 2);
       return { text, usedFallback: false };
     } catch (primaryErr) {
-      // Attempt 2: fallback model with retries
-      const fallbackModel = FALLBACK_MODELS[providerKey];
-      if (!fallbackModel || fallbackModel === primaryModel) {
-        // No different fallback available — give up
-        throw primaryErr;
+      // Attempt 2+: iterate through the fallback chain
+      const fallbackList = FALLBACK_MODELS[providerKey] || [];
+      const tried = [primaryModel];
+      let lastErr = primaryErr;
+      for (const fallbackModel of fallbackList) {
+        // Skip if same as primary or already tried
+        if (tried.includes(fallbackModel)) continue;
+        tried.push(fallbackModel);
+        try {
+          const text = await askWithRetry(askFn, p, fallbackModel, hist, key, sys, maxTokens, 2);
+          return { text, usedFallback: true };
+        } catch (e) {
+          lastErr = e;
+          // Move to next fallback
+        }
       }
-      try {
-        const text = await askWithRetry(askFn, p, fallbackModel, hist, key, sys, maxTokens, 2);
-        return { text, usedFallback: true };
-      } catch (fallbackErr) {
-        // Both failed — throw the more informative one
-        throw new Error('Primary: ' + primaryErr.message + '; Fallback: ' + fallbackErr.message);
-      }
+      // Everything in the chain failed
+      throw new Error('Primary (' + primaryModel + '): ' + primaryErr.message + '; All fallbacks failed (last: ' + lastErr.message + ')');
     }
   }
 
@@ -756,6 +763,39 @@ export default async function handler(req, res) {
     } finally {
       reader.releaseLock();
     }
+  }
+
+  // Gemini streaming wrapper that falls back through the Gemini model chain if
+  // the primary fails BEFORE producing any output. Gemini has been the most
+  // failure-prone provider, so this gives it more resilience than the other
+  // models get. Mid-stream failures can't be recovered (we don't want to emit
+  // partial text from two different models) — those still fail hard.
+  async function* streamGeminiWithFallback(p, primaryModel, hist, key, sys, maxTokens, useWebSearch) {
+    const chain = [primaryModel].concat((FALLBACK_MODELS.gemini || []).filter(m => m !== primaryModel));
+    let lastErr = null;
+    for (let i = 0; i < chain.length; i++) {
+      const model = chain[i];
+      let emittedAny = false;
+      try {
+        const gen = streamGemini(p, model, hist, key, sys, maxTokens, useWebSearch);
+        for await (const chunk of gen) {
+          emittedAny = true;
+          yield chunk;
+        }
+        // Primary (or fallback that succeeded) completed normally
+        return;
+      } catch (e) {
+        lastErr = e;
+        if (emittedAny) {
+          // Already streamed partial content — can't safely restart. Surface the error.
+          throw e;
+        }
+        // No output yet — safe to try the next model in the chain
+        if (i < chain.length - 1) continue;
+      }
+    }
+    // Chain exhausted with no success
+    throw lastErr || new Error('Gemini fallback chain exhausted');
   }
 
   async function* streamGrok(p, model, hist, key, sys, maxTokens, useWebSearch) {
@@ -1134,7 +1174,7 @@ export default async function handler(req, res) {
         30000, 'Claude'
       );
       const geminiStreamP = withTimeout(
-        runStreamForModel('Gemini', () => streamGemini(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH_MEDIUM)),
+        runStreamForModel('Gemini', () => streamGeminiWithFallback(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH_MEDIUM)),
         25000, 'Gemini'
       );
 
@@ -1478,7 +1518,7 @@ export default async function handler(req, res) {
     const streamPromises = [
       withTimeout(runStreamForModel('Claude',  () => streamClaude (fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 30000, 'Claude'),
       withTimeout(runStreamForModel('ChatGPT', () => streamOpenAI (fullPrompt, models.openai, convHistory, KEYS.openai,    systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 25000, 'ChatGPT'),
-      withTimeout(runStreamForModel('Gemini',  () => streamGemini (fullPrompt, models.gemini, convHistory, KEYS.gemini,    systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 25000, 'Gemini'),
+      withTimeout(runStreamForModel('Gemini',  () => streamGeminiWithFallback(fullPrompt, models.gemini, convHistory, KEYS.gemini,    systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 25000, 'Gemini'),
       withTimeout(runStreamForModel('Grok',    () => streamGrok   (fullPrompt, models.grok,   convHistory, KEYS.grok,      systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 22000, 'Grok'),
     ];
 
