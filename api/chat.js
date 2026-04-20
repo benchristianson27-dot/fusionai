@@ -206,7 +206,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { prompt, history, tier: clientTier, mode, fileData, mainMode, userEmail, teacherPromptCount, stream: wantsStream } = req.body;
+  const { prompt, history, tier: clientTier, mode, fileData, mainMode, userEmail, teacherPromptCount, stream: wantsStream, canvasQuery } = req.body;
   const tier = clientTier || 'free';
   if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
 
@@ -231,7 +231,10 @@ export default async function handler(req, res) {
   const activeMode = mode || 'normal';
   const convHistory = Array.isArray(history) ? history.slice(-20) : [];
 
-  const complexity = classifyQuery(prompt, convHistory, fileData, mainMode);
+  // Canvas queries (e.g. "what's due tomorrow") don't benefit from multi-AI synthesis.
+  // The Canvas context data in the prompt is factual, and 1 model answering is
+  // cheaper, faster, and avoids inconsistencies between 4 AIs reading the same data.
+  const complexity = canvasQuery ? 'simple' : classifyQuery(prompt, convHistory, fileData, mainMode);
   const systemPrompt = buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount, prompt);
 
   const images = (fileData || []).filter(f => f.type === 'image' && f.imageBase64);
