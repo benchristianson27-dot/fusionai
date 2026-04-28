@@ -134,6 +134,19 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
   const toneHints = analyzeTone(prompt);
   let sys;
 
+  // ── Current date awareness ──
+  // Each model's training cutoff differs (Claude 2025, ChatGPT 2023, etc.) so
+  // without this they disagree on basic time questions. Inject the actual
+  // server-side date so all four models answer consistently with reality.
+  const _now = new Date();
+  const _dateLine = _now.toLocaleDateString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    timeZone: 'America/Phoenix',
+  });
+  const dateContext = 'CURRENT DATE: Today is ' + _dateLine + '. Use this for any '
+    + '"what year/date/day is it" question. Do not guess from your training data — '
+    + 'your training cutoff is in the past, but the actual current date is ' + _dateLine + '. ';
+
   // Context note that prefixes ALL complexity tiers: "Fusion" means the product.
   // Prevents the common mistake of interpreting "marketing for Fusion" as
   // "marketing for nuclear fusion energy."
@@ -142,18 +155,21 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
 
   if (complexity === 'simple') {
     sys = 'You are FusionAI, an AI assistant at fusion4ai.com created by Ben Christianson. '
+        + dateContext
         + fusionContextNote
         + 'Respond naturally and conversationally. Keep it brief — match the energy and length of the user\'s message. '
         + 'If they say hi, just say hi back warmly in 1-2 sentences. Do NOT over-explain what you are or how you work unless asked. '
         + 'Do NOT end with follow-up questions for casual messages. Do NOT use markdown headers.';
   } else if (complexity === 'medium') {
     sys = 'You are FusionAI, an AI assistant at fusion4ai.com created by Ben Christianson. '
+        + dateContext
         + fusionContextNote
         + 'Give a clear, helpful answer. Be specific and direct. '
         + 'Keep the response focused and proportional to the question — don\'t over-elaborate. '
         + toneHints.instructions;
   } else {
     sys = 'You are FusionAI, an AI assistant at fusion4ai.com created by Ben Christianson. '
+        + dateContext
         + fusionContextNote
         + 'Give thorough, expert-level answers with real names, numbers, and concrete examples. '
         + 'Be direct with clear recommendations. '
@@ -1219,7 +1235,13 @@ export default async function handler(req, res) {
 
       // Search mode forces web_search on individual streams (slower but accurate).
       // Otherwise leave it off so cards aren't frozen for 10-15s before tokens flow.
-      const INDIVIDUAL_USE_SEARCH_MEDIUM = activeMode === 'search';
+      // Auto-enable for queries that obviously need fresh data (stock prices, scores,
+      // "today/latest/right now" wording, ticker symbols) — without this, asking
+      // "what's TSLA at" returns 4 stale-from-training answers.
+      const NEEDS_FRESH_DATA_MEDIUM = /\b(stock|share|ticker|price of|how much is|what is.*worth|today|tonight|tomorrow|yesterday|this week|this month|right now|currently|latest|breaking|news|score|won|lost|game|election|weather|forecast|temperature|trending|recent|just released|came out|happened)\b/i.test(prompt)
+        || /\$[A-Z]{1,5}\b/.test(prompt)
+        || /\b(NVDA|TSLA|AAPL|GOOGL|MSFT|AMZN|META|SPY|QQQ|BTC|ETH)\b/.test(prompt);
+      const INDIVIDUAL_USE_SEARCH_MEDIUM = activeMode === 'search' || NEEDS_FRESH_DATA_MEDIUM;
 
       const claudeCtrl = makeController();
       const claudeStreamP = withTimeout(
@@ -1547,7 +1569,13 @@ export default async function handler(req, res) {
 
     // Search mode forces web_search on individual streams. Otherwise off — search
     // adds 10-15s before tokens flow, freezing Workstation cards.
-    const INDIVIDUAL_USE_SEARCH = activeMode === 'search';
+    // Auto-enable for queries that obviously need fresh data (stock prices, scores,
+    // "today/latest/right now" wording, ticker symbols) so individual streams
+    // don't return stale-from-training answers while the synthesizer alone searches.
+    const NEEDS_FRESH_DATA = /\b(stock|share|ticker|price of|how much is|what is.*worth|today|tonight|tomorrow|yesterday|this week|this month|right now|currently|latest|breaking|news|score|won|lost|game|election|weather|forecast|temperature|trending|recent|just released|came out|happened)\b/i.test(prompt)
+      || /\$[A-Z]{1,5}\b/.test(prompt)
+      || /\b(NVDA|TSLA|AAPL|GOOGL|MSFT|AMZN|META|SPY|QQQ|BTC|ETH)\b/.test(prompt);
+    const INDIVIDUAL_USE_SEARCH = activeMode === 'search' || NEEDS_FRESH_DATA;
 
     const claudeCtrl = makeController();
     const openaiCtrl = makeController();
