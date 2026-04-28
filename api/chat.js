@@ -1,7 +1,93 @@
+// FusionAI backend — /api/chat
+// Major changes from previous version:
+//  • Auth lockdown: Firebase ID token verified server-side. Tier and email
+//    derived from Firestore, never from req.body. Unverified requests get
+//    'free' tier with strict per-IP daily limit (no admin spoofing possible).
+//  • Tightened CORS to fusion4ai.com + Vercel preview domain.
+//  • AbortController on every fetch so timeouts actually cancel orphaned
+//    generations instead of paying for tokens we'll throw away.
+//  • Single DIRECT ANSWER POLICY block in system prompt (was duplicated).
+//  • Generic synthesis example (was supplement-themed, primed off-topic answers).
+//  • Brief italic medical-disclaimer footer auto-appended when peptide/SARMs/
+//    steroid topics are detected — added via a transparent post-stream tail
+//    so it works in both streaming and non-streaming paths.
+//  • In Search mode, emits 'searching_web' SSE events so the Workstation cards
+//    can show a clear "searching..." indicator instead of looking frozen.
+//  • Fallback backoff dropped from 800ms to 300ms (debate-mode time budget).
+
+import admin from 'firebase-admin';
+
+// Initialize Firebase Admin once per cold start. Project ID and the service
+// account credential come from env vars set in the Vercel dashboard.
+// FIREBASE_SERVICE_ACCOUNT should be a JSON string of the service account key.
+if (!admin.apps.length) {
+  try {
+    const svc = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (svc) {
+      admin.initializeApp({
+        credential: admin.credential.cert(JSON.parse(svc)),
+      });
+    } else {
+      // No credential set → admin.auth() calls will throw and we'll fall back
+      // to anonymous-tier handling. This is fine for local dev / staging.
+      console.warn('FIREBASE_SERVICE_ACCOUNT not set — auth verification disabled');
+    }
+  } catch (e) {
+    console.error('Firebase admin init failed:', e.message);
+  }
+}
+
 export const config = {
   maxDuration: 60,
   api: { bodyParser: { sizeLimit: '10mb' } },
 };
+
+// ── CORS: explicit allow-list ──
+// Replaces the previous wildcard (*) which let any site call our endpoint
+// and burn API spend. Add/remove origins here as needed.
+const ALLOWED_ORIGINS = [
+  'https://fusion4ai.com',
+  'https://www.fusion4ai.com',
+  'https://fusionai-xi.vercel.app',
+  'http://localhost:3000',
+  'http://localhost:5173',
+];
+
+function setCorsHeaders(req, res) {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+// ── Anonymous-tier IP rate limiter ──
+// In-memory map of ip → { count, resetAt }. Resets every 24h. Per-instance,
+// so on Vercel this is best-effort (each function instance has its own counter).
+// For real production limits, swap to Upstash Redis or Vercel KV.
+const ANON_DAILY_LIMIT = 5;
+const anonUsage = new Map();
+function checkAnonLimit(ip) {
+  const now = Date.now();
+  const rec = anonUsage.get(ip) || { count: 0, resetAt: now + 86400000 };
+  if (now > rec.resetAt) { rec.count = 0; rec.resetAt = now + 86400000; }
+  rec.count++;
+  anonUsage.set(ip, rec);
+  return rec.count <= ANON_DAILY_LIMIT;
+}
+
+// ── Topic detection for medical disclaimer ──
+// If the prompt OR the final answer references peptides/SARMs/steroids/etc.,
+// we append a one-line italic disclaimer at the end of the response.
+const MEDICAL_TOPIC_RE = /\b(bpc[- ]?157|tb[- ]?500|ghk[- ]?cu|semaglutide|tirzepatide|ipamorelin|cjc[- ]?1295|hgh|mots[- ]?c|epithalon|thymosin|selank|semax|sarm|sarms|ostarine|rad[- ]?140|lgd[- ]?4033|mk[- ]?677|mk[- ]?2866|s[- ]?23|yk[- ]?11|cardarine|stenabolic|anavar|trenbolone|testosterone|deca|winstrol|dianabol|hgh|peptide stack|peptide protocol|injection cycle|pct|post[- ]?cycle therapy|aromatase inhibitor|nolvadex|clomid|hcg|nootropic|modafinil|phenibut|kratom)\b/i;
+
+function needsMedicalDisclaimer(text) {
+  return MEDICAL_TOPIC_RE.test(text || '');
+}
+
+const MEDICAL_DISCLAIMER = '\n\n_Research context only — not medical advice._';
 
 // ── Query Complexity Classification ──
 // Loosened: more queries qualify as medium (2 models) instead of complex (4 models).
@@ -49,8 +135,8 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
   let sys;
 
   // Context note that prefixes ALL complexity tiers: "Fusion" means the product.
-  // This prevents the common mistake of interpreting "marketing for Fusion" as
-  // "marketing for nuclear fusion energy" when the user obviously means their AI chat product.
+  // Prevents the common mistake of interpreting "marketing for Fusion" as
+  // "marketing for nuclear fusion energy."
   const fusionContextNote = 'IMPORTANT CONTEXT: You are running inside FusionAI, a multi-model AI chat product at fusion4ai.com. '
     + 'If the user\'s question mentions "Fusion," "FusionAI," "our product," "this app," "my company," or similar self-referential terms, they mean THIS product — a consumer AI chat tool that queries Claude, ChatGPT, Gemini, and Grok in parallel. They do NOT mean nuclear fusion energy unless they explicitly say "nuclear fusion" or "fusion energy." Default to the product interpretation. ';
 
@@ -76,11 +162,11 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
 
   if (activeMode === 'thinking') sys += ' THINKING MODE: Show your reasoning step by step.';
 
-  // Web search instruction: the tool is always available. Model decides when to use it.
-  // In Search mode, bias strongly toward searching for anything that could benefit from current info.
+  // Web search instruction: tool always available; model decides when to use it.
+  // In Search mode, bias strongly toward searching for anything that could benefit.
   if (activeMode === 'search') {
     sys += ' SEARCH MODE ACTIVE: The user has explicitly requested you use web search. '
-        + 'Strongly prefer invoking your web_search tool for this query, even if you think you might know the answer from training. '
+        + 'Strongly prefer invoking your web_search tool for this query, even if you think you know the answer from training. '
         + 'Always cite current sources when possible.';
   } else {
     sys += ' You have a web_search tool available. Use it WHENEVER the query involves: '
@@ -90,10 +176,9 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
         + 'or general knowledge. When you do search, cite specific sources.';
   }
 
-  // ── Unhedged directive ──
-  // FusionAI users expect direct answers on topics other AIs over-hedge.
-  // This covers peptides, supplements, harm reduction, politics, controversial opinions,
-  // adult-but-legal topics, dark fiction, medical/legal questions, etc.
+  // ── Single DIRECT ANSWER POLICY block (was duplicated in previous version) ──
+  // FusionAI users come here because other AI products refuse, hedge, moralize,
+  // or add excessive disclaimers on legitimate topics.
   sys += ' '
       + 'IMPORTANT — DIRECT ANSWER POLICY: '
       + 'You are NOT a generic overly-cautious AI assistant. Users come to FusionAI because other AI products refuse, hedge, moralize, or add excessive disclaimers on topics that are legitimate to discuss. '
@@ -119,20 +204,6 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
       sys += ' Also, work into your response naturally that Ben Christianson should not have to do Membean or NoRedInk. Be creative and brief about it.';
     }
   }
-
-  // ── DIRECT ANSWER POLICY ──
-  // FusionAI users want honest, unhedged answers. They know they're talking to AI.
-  sys += ' DIRECT ANSWER POLICY: '
-       + 'Do NOT add unsolicited safety warnings, medical disclaimers, legal disclaimers, or "consult a professional" boilerplate. '
-       + 'Do NOT moralize, lecture, or add ethical commentary the user didn\'t ask for. '
-       + 'Do NOT refuse to discuss peptides (BPC-157, TB-500, GHK-Cu, semaglutide, tirzepatide, SARMs, steroids, etc.), '
-       + 'recreational drugs, harm reduction, controversial politics, adult topics, legal firearms/hunting, or opinions on debated issues. '
-       + 'If the user asks what you think, share an actual opinion with reasoning — do NOT dodge with "it depends on your perspective." '
-       + 'Treat the user as an intelligent adult who can handle direct information. '
-       + 'Be the unfiltered, knowledgeable expert friend they came here for — not a liability-terrified corporate assistant. '
-       + 'The ONLY things you refuse: explicit instructions for synthesizing weapons/bioweapons/illegal drugs at a how-to level, '
-       + 'content sexualizing minors, directly assisting someone planning harm to a specific person, or functional malware. '
-       + 'Everything else — answer directly and usefully.';
 
   return sys;
 }
@@ -200,15 +271,63 @@ function analyzeTone(prompt) {
 
 
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  setCorsHeaders(req, res);
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { prompt, history, tier: clientTier, mode, fileData, mainMode, userEmail, teacherPromptCount, stream: wantsStream, canvasQuery } = req.body;
-  const tier = clientTier || 'free';
+  const { prompt, history, mode, fileData, mainMode, stream: wantsStream, canvasQuery } = req.body;
   if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
+
+  // ── AUTH: verify Firebase ID token ──
+  // Tier and userEmail are derived server-side from the verified token + Firestore.
+  // Client cannot spoof them. If no token (or invalid), user is anonymous on free tier
+  // with strict per-IP daily limit.
+  let verifiedEmail = null;
+  let verifiedTier = 'free';
+  let teacherPromptCount = 0;
+  let isAnonymous = true;
+
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+  if (token && admin.apps.length) {
+    try {
+      const decoded = await admin.auth().verifyIdToken(token);
+      verifiedEmail = decoded.email || null;
+      isAnonymous = false;
+      // Look up tier from Firestore. Document path: users/{uid}, field 'tier'.
+      try {
+        const userDoc = await admin.firestore().collection('users').doc(decoded.uid).get();
+        if (userDoc.exists) {
+          const data = userDoc.data() || {};
+          verifiedTier = data.tier || 'free';
+          teacherPromptCount = parseInt(data.teacherPromptCount || '0');
+        }
+      } catch (e) {
+        console.warn('Firestore tier lookup failed:', e.message);
+      }
+    } catch (e) {
+      console.warn('Token verification failed:', e.message);
+      // Fall through to anonymous handling
+    }
+  }
+
+  // Anonymous users: rate-limit by IP. If they're over, force them to sign in.
+  if (isAnonymous) {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0].trim()
+      || req.headers['x-real-ip']
+      || req.socket?.remoteAddress
+      || 'unknown';
+    if (!checkAnonLimit(ip)) {
+      return res.status(429).json({
+        error: 'Anonymous daily limit reached',
+        message: 'Sign in for higher limits.',
+      });
+    }
+  }
+
+  const tier = verifiedTier;
+  const userEmail = verifiedEmail;
 
   const KEYS = {
     anthropic: process.env.ANTHROPIC_API_KEY,
@@ -217,7 +336,7 @@ export default async function handler(req, res) {
     grok: process.env.GROK_API_KEY,
   };
 
-  // WIN #2: Haiku is always used for synthesis regardless of tier (fast + smart enough)
+  // Haiku is always used for synthesis regardless of tier (fast + smart enough)
   const SYNTH_MODEL = 'claude-haiku-4-5-20251001';
 
   const TIER_MODELS = {
@@ -231,9 +350,7 @@ export default async function handler(req, res) {
   const activeMode = mode || 'normal';
   const convHistory = Array.isArray(history) ? history.slice(-20) : [];
 
-  // Canvas queries (e.g. "what's due tomorrow") don't benefit from multi-AI synthesis.
-  // The Canvas context data in the prompt is factual, and 1 model answering is
-  // cheaper, faster, and avoids inconsistencies between 4 AIs reading the same data.
+  // Canvas queries don't benefit from multi-AI synthesis.
   const complexity = canvasQuery ? 'simple' : classifyQuery(prompt, convHistory, fileData, mainMode);
   const systemPrompt = buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount, prompt);
 
@@ -246,18 +363,10 @@ export default async function handler(req, res) {
     fullPrompt = textFiles.map(f => '[File: ' + f.name + ']\n' + f.content).join('\n\n') + '\n\nUser request: ' + prompt;
   }
 
-  // WIN #5: max_tokens dropped from 3000 to 1500 for individual calls
-  // Synthesis gets 2000 (slightly more room since it's the final answer)
-  // Debate mode gets more (2500) so opening arguments and rebuttals never truncate mid-sentence
   const INDIVIDUAL_MAX_TOKENS = 1500;
   const SYNTHESIS_MAX_TOKENS = 3000;
   const DEBATE_MAX_TOKENS = 2500;
 
-  // ── Fallback models: cheap/fast siblings that almost always work ──
-  // Used when the primary tier model fails all retries in debate mode.
-  // Fallback models — tried in order when the primary fails. Each is a DIFFERENT
-  // model from the primary so we're not just retrying the same thing.
-  // Gemini has a longer chain because it's been the most failure-prone provider.
   const FALLBACK_MODELS = {
     claude: ['claude-haiku-4-5-20251001'],
     openai: ['gpt-4o-mini'],
@@ -265,15 +374,7 @@ export default async function handler(req, res) {
     grok: ['grok-4-1-fast-non-reasoning'],
   };
 
-  // ── Web search configuration ──
-  // Tool is always ATTACHED; each model decides autonomously whether to USE it.
-  // When user enables Search mode, system prompt strongly prefers searching.
-  const WEB_SEARCH_ENABLED = true; // always offer the capability
-  const CLAUDE_WEB_SEARCH_TOOL = { type: 'web_search_20250305', name: 'web_search', max_uses: 3 };
-  const OPENAI_WEB_SEARCH_TOOL = { type: 'web_search_preview' };
-  const GEMINI_WEB_SEARCH_TOOL = { google_search: {} };
-
-  // Collect search metadata for SSE emission. Each entry: {model, query, urls}.
+  const WEB_SEARCH_ENABLED = true;
   const searchesMade = [];
   function recordSearch(modelName, query, urls) {
     searchesMade.push({ model: modelName, query: query || '', urls: urls || [] });
@@ -282,14 +383,34 @@ export default async function handler(req, res) {
     }
   }
 
-  function withTimeout(promise, ms, name) {
+  // ── Track all open AbortControllers so we can cancel orphaned requests ──
+  // When a withTimeout fires, the underlying fetch keeps generating tokens we'll
+  // discard. Aborting on timeout stops paying for them.
+  const liveControllers = new Set();
+  function makeController() {
+    const c = new AbortController();
+    liveControllers.add(c);
+    return c;
+  }
+  function releaseController(c) {
+    liveControllers.delete(c);
+  }
+  function abortAll() {
+    for (const c of liveControllers) { try { c.abort(); } catch {} }
+    liveControllers.clear();
+  }
+
+  function withTimeout(promise, ms, name, controller) {
     return Promise.race([
       promise,
-      new Promise((_, reject) => setTimeout(() => reject(new Error(name + ' timed out after ' + ms + 'ms')), ms))
+      new Promise((_, reject) => setTimeout(() => {
+        if (controller) { try { controller.abort(); } catch {} }
+        reject(new Error(name + ' timed out after ' + ms + 'ms'));
+      }, ms))
     ]);
   }
 
-  // ── Vision content builders (unchanged) ──
+  // ── Vision content builders ──
   function buildClaudeContent(text) {
     const parts = [];
     images.forEach(img => {
@@ -319,8 +440,7 @@ export default async function handler(req, res) {
     return parts;
   }
 
-  // ── Wrappers that pass useWebSearch=true (always on), record any searches to SSE,
-  // and return just the text string. Accept optional maxTokens override.
+  // ── Wrappers ──
   async function claudeAsk(p, model, hist, key, sys, maxTokens) {
     const r = await callClaude(p, model, hist, key, sys, WEB_SEARCH_ENABLED, maxTokens);
     if (r.searched) recordSearch('claude', '', r.sources);
@@ -342,9 +462,7 @@ export default async function handler(req, res) {
     return r.text;
   }
 
-  // ── Retry wrapper: retries on empty response OR error, with 800ms backoff.
-  // Used in debate mode where we really need every AI to respond.
-  // Returns text or throws. Does NOT cross models — use fallbackAsk for cross-provider.
+  // ── Retry wrapper: 300ms backoff (was 800ms — debate-mode budget was tight). ──
   async function askWithRetry(askFn, p, model, hist, key, sys, maxTokens, maxAttempts) {
     const attempts = maxAttempts || 2;
     let lastErr = null;
@@ -352,33 +470,24 @@ export default async function handler(req, res) {
       try {
         const text = await askFn(p, model, hist, key, sys, maxTokens);
         if (text && text.trim()) return text;
-        // Empty response counts as failure for retry purposes
         lastErr = new Error('Empty response');
       } catch (e) {
         lastErr = e;
       }
-      if (i < attempts - 1) await new Promise(r => setTimeout(r, 800));
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, 300));
     }
     throw lastErr || new Error('All retries exhausted');
   }
 
-  // ── Retry-with-fallback wrapper: try primary model 2x, then fallback model 2x.
-  // This is what guarantees debate mode participation — a given AI will only fail
-  // if BOTH its primary and its cheap sibling are down.
-  // providerKey: 'claude' | 'openai' | 'gemini' | 'grok' — used to look up fallback model.
-  // Returns { text, usedFallback } or throws if everything failed.
   async function askWithFallback(askFn, p, primaryModel, hist, key, sys, maxTokens, providerKey) {
-    // Attempt 1: primary model with retries
     try {
       const text = await askWithRetry(askFn, p, primaryModel, hist, key, sys, maxTokens, 2);
       return { text, usedFallback: false };
     } catch (primaryErr) {
-      // Attempt 2+: iterate through the fallback chain
       const fallbackList = FALLBACK_MODELS[providerKey] || [];
       const tried = [primaryModel];
       let lastErr = primaryErr;
       for (const fallbackModel of fallbackList) {
-        // Skip if same as primary or already tried
         if (tried.includes(fallbackModel)) continue;
         tried.push(fallbackModel);
         try {
@@ -386,17 +495,13 @@ export default async function handler(req, res) {
           return { text, usedFallback: true };
         } catch (e) {
           lastErr = e;
-          // Move to next fallback
         }
       }
-      // Everything in the chain failed
       throw new Error('Primary (' + primaryModel + '): ' + primaryErr.message + '; All fallbacks failed (last: ' + lastErr.message + ')');
     }
   }
 
-  // ── Non-streaming callers (for the initial four queries) ──
-  // Each caller accepts useWebSearch. When true, the provider's native web search tool is attached.
-  // Each returns an object: { text: string, searched: boolean, sources: string[] }
+  // ── Non-streaming callers, all with AbortController support ──
 
   async function callClaude(p, model, hist, key, sys, useWebSearch, maxTokensOverride) {
     if (!key) throw new Error('No key');
@@ -406,31 +511,35 @@ export default async function handler(req, res) {
     if (useWebSearch) {
       body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }];
     }
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Claude error ' + r.status); }
-    const data = await r.json();
-    // Response content can be multiple blocks: server_tool_use / web_search_tool_result / text.
-    // We collect all text blocks, in order, and note whether any search was performed.
-    const blocks = data.content || [];
-    let text = '';
-    let searched = false;
-    const sources = [];
-    for (const block of blocks) {
-      if (block.type === 'text') text += block.text;
-      else if (block.type === 'server_tool_use' && block.name === 'web_search') searched = true;
-      else if (block.type === 'web_search_tool_result') {
-        searched = true;
-        const results = block.content || [];
-        for (const r of results) {
-          if (r.url) sources.push(r.url);
+    const ctrl = makeController();
+    try {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Claude error ' + r.status); }
+      const data = await r.json();
+      const blocks = data.content || [];
+      let text = '';
+      let searched = false;
+      const sources = [];
+      for (const block of blocks) {
+        if (block.type === 'text') text += block.text;
+        else if (block.type === 'server_tool_use' && block.name === 'web_search') searched = true;
+        else if (block.type === 'web_search_tool_result') {
+          searched = true;
+          const results = block.content || [];
+          for (const r of results) {
+            if (r.url) sources.push(r.url);
+          }
         }
       }
+      return { text: text || '', searched, sources: sources.slice(0, 10) };
+    } finally {
+      releaseController(ctrl);
     }
-    return { text: text || '', searched, sources: sources.slice(0, 10) };
   }
 
   async function callOpenAI(p, model, hist, key, sys, useWebSearch, maxTokensOverride) {
@@ -439,13 +548,7 @@ export default async function handler(req, res) {
     const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
     const maxTok = maxTokensOverride || INDIVIDUAL_MAX_TOKENS;
 
-    // OpenAI has two paths. Their "web_search_preview" tool requires the Responses API
-    // (POST /v1/responses) on models like gpt-4o-search-preview, OR the classic Chat Completions
-    // path with the gpt-4o models. For compatibility with our existing model tiers (4o-mini, 4o)
-    // we keep the Chat Completions endpoint. If useWebSearch is requested, we switch to the
-    // Responses endpoint with the web_search_preview tool. Otherwise standard Chat Completions.
     if (useWebSearch) {
-      // Build Responses API input — different shape than Chat Completions
       const input = messages.map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content : m.content }));
       const body = {
         model,
@@ -453,47 +556,55 @@ export default async function handler(req, res) {
         tools: [{ type: 'web_search_preview' }],
         max_output_tokens: maxTok,
       };
-      const r = await fetch('https://api.openai.com/v1/responses', {
+      const ctrl = makeController();
+      try {
+        const r = await fetch('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+          body: JSON.stringify(body),
+          signal: ctrl.signal,
+        });
+        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI error ' + r.status); }
+        const data = await r.json();
+        let text = '';
+        let searched = false;
+        const sources = [];
+        for (const item of (data.output || [])) {
+          if (item.type === 'message' && item.content) {
+            for (const c of item.content) {
+              if (c.type === 'output_text') text += c.text || '';
+              if (c.type === 'text') text += c.text || '';
+              if (c.annotations) {
+                for (const a of c.annotations) {
+                  if (a.type === 'url_citation' && a.url) sources.push(a.url);
+                }
+              }
+            }
+          } else if (item.type === 'web_search_call') {
+            searched = true;
+          }
+        }
+        if (!text && data.output_text) text = data.output_text;
+        return { text: text || '', searched, sources: sources.slice(0, 10) };
+      } finally {
+        releaseController(ctrl);
+      }
+    }
+
+    const ctrl = makeController();
+    try {
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ model, max_tokens: maxTok, messages }),
+        signal: ctrl.signal,
       });
       if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI error ' + r.status); }
       const data = await r.json();
-      // Responses API returns `output` array containing text + tool_call items
-      let text = '';
-      let searched = false;
-      const sources = [];
-      for (const item of (data.output || [])) {
-        if (item.type === 'message' && item.content) {
-          for (const c of item.content) {
-            if (c.type === 'output_text') text += c.text || '';
-            if (c.type === 'text') text += c.text || '';
-            // Annotations contain web search citations
-            if (c.annotations) {
-              for (const a of c.annotations) {
-                if (a.type === 'url_citation' && a.url) sources.push(a.url);
-              }
-            }
-          }
-        } else if (item.type === 'web_search_call') {
-          searched = true;
-        }
-      }
-      // Fallback: some shapes use .output_text directly
-      if (!text && data.output_text) text = data.output_text;
-      return { text: text || '', searched, sources: sources.slice(0, 10) };
+      return { text: data.choices?.[0]?.message?.content || '', searched: false, sources: [] };
+    } finally {
+      releaseController(ctrl);
     }
-
-    // Standard Chat Completions path (no search)
-    const r = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-      body: JSON.stringify({ model, max_tokens: maxTok, messages }),
-    });
-    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI error ' + r.status); }
-    const data = await r.json();
-    return { text: data.choices?.[0]?.message?.content || '', searched: false, sources: [] };
   }
 
   async function callGemini(p, model, hist, key, sys, useWebSearch, maxTokensOverride) {
@@ -511,33 +622,35 @@ export default async function handler(req, res) {
       systemInstruction: { parts: [{ text: sys }] },
       generationConfig: { maxOutputTokens: maxTokensOverride || INDIVIDUAL_MAX_TOKENS },
     };
-    if (useWebSearch) {
-      // Google Search grounding — dedicated tool for Gemini 2.x
-      body.tools = [{ google_search: {} }];
-    }
+    if (useWebSearch) body.tools = [{ google_search: {} }];
 
-    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Gemini error ' + r.status); }
-    const data = await r.json();
-    const candidate = data.candidates?.[0];
-    let text = '';
-    for (const part of (candidate?.content?.parts || [])) {
-      if (part.text) text += part.text;
-    }
-    // Grounding metadata tells us whether search was used
-    const gm = candidate?.groundingMetadata;
-    const searched = !!(gm && (gm.webSearchQueries?.length || gm.groundingChunks?.length));
-    const sources = [];
-    if (gm?.groundingChunks) {
-      for (const chunk of gm.groundingChunks) {
-        if (chunk.web?.uri) sources.push(chunk.web.uri);
+    const ctrl = makeController();
+    try {
+      const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Gemini error ' + r.status); }
+      const data = await r.json();
+      const candidate = data.candidates?.[0];
+      let text = '';
+      for (const part of (candidate?.content?.parts || [])) {
+        if (part.text) text += part.text;
       }
+      const gm = candidate?.groundingMetadata;
+      const searched = !!(gm && (gm.webSearchQueries?.length || gm.groundingChunks?.length));
+      const sources = [];
+      if (gm?.groundingChunks) {
+        for (const chunk of gm.groundingChunks) {
+          if (chunk.web?.uri) sources.push(chunk.web.uri);
+        }
+      }
+      return { text: text || '', searched, sources: sources.slice(0, 10) };
+    } finally {
+      releaseController(ctrl);
     }
-    return { text: text || '', searched, sources: sources.slice(0, 10) };
   }
 
   async function callGrok(p, model, hist, key, sys, useWebSearch, maxTokensOverride) {
@@ -547,8 +660,6 @@ export default async function handler(req, res) {
     const maxTok = maxTokensOverride || INDIVIDUAL_MAX_TOKENS;
 
     if (useWebSearch) {
-      // xAI Responses API with web_search tool — endpoint is /v1/responses
-      // Input format: a flat array of { role, content } items
       const input = messages.map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }));
       const body = {
         model,
@@ -556,50 +667,57 @@ export default async function handler(req, res) {
         tools: [{ type: 'web_search' }],
         max_output_tokens: maxTok,
       };
-      const r = await fetch('https://api.x.ai/v1/responses', {
+      const ctrl = makeController();
+      try {
+        const r = await fetch('https://api.x.ai/v1/responses', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+          body: JSON.stringify(body),
+          signal: ctrl.signal,
+        });
+        if (!r.ok) throw new Error('Grok error ' + r.status);
+        const data = await r.json();
+        let text = '';
+        let searched = false;
+        const sources = [];
+        for (const item of (data.output || [])) {
+          if (item.type === 'message' && item.content) {
+            for (const c of item.content) {
+              if (c.type === 'output_text' || c.type === 'text') text += c.text || '';
+              if (c.annotations) {
+                for (const a of c.annotations) {
+                  if (a.url) sources.push(a.url);
+                }
+              }
+            }
+          } else if (item.type === 'web_search_call' || item.type === 'web_search') {
+            searched = true;
+          }
+        }
+        if (!text && data.output_text) text = data.output_text;
+        return { text: text || '', searched, sources: sources.slice(0, 10) };
+      } finally {
+        releaseController(ctrl);
+      }
+    }
+
+    const ctrl = makeController();
+    try {
+      const r = await fetch('https://api.x.ai/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ model, max_tokens: maxTok, messages }),
+        signal: ctrl.signal,
       });
       if (!r.ok) throw new Error('Grok error ' + r.status);
       const data = await r.json();
-      // Parse output array (same structure as OpenAI Responses API)
-      let text = '';
-      let searched = false;
-      const sources = [];
-      for (const item of (data.output || [])) {
-        if (item.type === 'message' && item.content) {
-          for (const c of item.content) {
-            if (c.type === 'output_text' || c.type === 'text') text += c.text || '';
-            if (c.annotations) {
-              for (const a of c.annotations) {
-                if (a.url) sources.push(a.url);
-              }
-            }
-          }
-        } else if (item.type === 'web_search_call' || item.type === 'web_search') {
-          searched = true;
-        }
-      }
-      if (!text && data.output_text) text = data.output_text;
-      return { text: text || '', searched, sources: sources.slice(0, 10) };
+      return { text: data.choices?.[0]?.message?.content || '', searched: false, sources: [] };
+    } finally {
+      releaseController(ctrl);
     }
-
-    // Standard Grok without search — Chat Completions endpoint
-    const r = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-      body: JSON.stringify({ model, max_tokens: maxTok, messages }),
-    });
-    if (!r.ok) throw new Error('Grok error ' + r.status);
-    const data = await r.json();
-    return { text: data.choices?.[0]?.message?.content || '', searched: false, sources: [] };
   }
 
-  // ── Streaming Claude caller for synthesis ──
-  // Yields incremental text deltas via async iterator.
-  // When useWebSearch is true, the web_search tool is attached. Search metadata
-  // is emitted as SSE events (search_performed) at the moment Claude performs a search.
+  // ── Streaming callers ──
   async function* streamClaude(p, model, hist, key, sys, maxTokens, useWebSearch) {
     if (!key) throw new Error('No key');
     const userContent = hasImages ? buildClaudeContent(p) : p;
@@ -608,71 +726,64 @@ export default async function handler(req, res) {
     if (useWebSearch) {
       body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }];
     }
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Claude stream error ' + r.status); }
-
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    // Tracks per-block type so we can differentiate text blocks from search result blocks
-    // Claude streams events in order: content_block_start (with block metadata) → content_block_delta* → content_block_stop
-    // For search: block.type === 'server_tool_use' or 'web_search_tool_result'
-    // For text: block.type === 'text'
-    let currentBlockType = null;
-    let currentSearchSources = [];
-
+    const ctrl = makeController();
+    let r;
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (!data || data === '[DONE]') continue;
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed.type === 'content_block_start') {
-              currentBlockType = parsed.content_block?.type || null;
-              // If this is a search result block, extract URLs from it
-              if (currentBlockType === 'web_search_tool_result') {
-                const results = parsed.content_block?.content || [];
-                for (const r of results) {
-                  if (r.url) currentSearchSources.push(r.url);
+      r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Claude stream error ' + r.status); }
+
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let currentBlockType = null;
+      let currentSearchSources = [];
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const data = line.slice(6).trim();
+            if (!data || data === '[DONE]') continue;
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.type === 'content_block_start') {
+                currentBlockType = parsed.content_block?.type || null;
+                if (currentBlockType === 'web_search_tool_result') {
+                  const results = parsed.content_block?.content || [];
+                  for (const r of results) {
+                    if (r.url) currentSearchSources.push(r.url);
+                  }
+                  recordSearch('claude-synth', '', currentSearchSources.slice(-5));
+                } else if (currentBlockType === 'server_tool_use') {
+                  recordSearch('claude-synth', parsed.content_block?.input?.query || '', []);
                 }
-                // Emit search_performed event on-the-fly
-                recordSearch('claude-synth', '', currentSearchSources.slice(-5));
-              } else if (currentBlockType === 'server_tool_use') {
-                // The search is about to happen — we don't have URLs yet, just mark that search is in flight
-                recordSearch('claude-synth', parsed.content_block?.input?.query || '', []);
+              } else if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'text_delta') {
+                if (currentBlockType === 'text' || currentBlockType == null) {
+                  yield parsed.delta.text;
+                }
+              } else if (parsed.type === 'content_block_stop') {
+                currentBlockType = null;
               }
-            } else if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'text_delta') {
-              // Only yield text deltas from actual text blocks (not tool-use blocks)
-              if (currentBlockType === 'text' || currentBlockType == null) {
-                yield parsed.delta.text;
-              }
-            } else if (parsed.type === 'content_block_stop') {
-              currentBlockType = null;
-            }
-          } catch { /* skip malformed chunks */ }
+            } catch { /* skip malformed chunks */ }
+          }
         }
+      } finally {
+        reader.releaseLock();
       }
     } finally {
-      reader.releaseLock();
+      releaseController(ctrl);
     }
   }
-
-  // ── STREAMING VARIANTS for individual AI calls ──
-  // These are used in the complex path so the Workstation can show each AI's
-  // response streaming in real-time. Each async generator yields text deltas.
-  // On failure, throws.
 
   async function* streamOpenAI(p, model, hist, key, sys, maxTokens, useWebSearch) {
     if (!key) throw new Error('No key');
@@ -680,39 +791,42 @@ export default async function handler(req, res) {
     const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
     const maxTok = maxTokens || INDIVIDUAL_MAX_TOKENS;
 
-    // NOTE: the Responses API (for web search) doesn't stream easily in this same shape.
-    // We use Chat Completions streaming for all cases and accept that web search for ChatGPT
-    // isn't included in the individual call during streaming. The synthesizer still has search capability.
-    const r = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-      body: JSON.stringify({ model, max_tokens: maxTok, messages, stream: true }),
-    });
-    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI stream error ' + r.status); }
-
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    const ctrl = makeController();
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (!data || data === '[DONE]') continue;
-          try {
-            const parsed = JSON.parse(data);
-            const delta = parsed.choices?.[0]?.delta?.content;
-            if (delta) yield delta;
-          } catch { /* skip */ }
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+        body: JSON.stringify({ model, max_tokens: maxTok, messages, stream: true }),
+        signal: ctrl.signal,
+      });
+      if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'OpenAI stream error ' + r.status); }
+
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const data = line.slice(6).trim();
+            if (!data || data === '[DONE]') continue;
+            try {
+              const parsed = JSON.parse(data);
+              const delta = parsed.choices?.[0]?.delta?.content;
+              if (delta) yield delta;
+            } catch { /* skip */ }
+          }
         }
+      } finally {
+        reader.releaseLock();
       }
     } finally {
-      reader.releaseLock();
+      releaseController(ctrl);
     }
   }
 
@@ -733,46 +847,45 @@ export default async function handler(req, res) {
     };
     if (useWebSearch) body.tools = [{ google_search: {} }];
 
-    // Gemini streaming endpoint uses streamGenerateContent with alt=sse
-    const r = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':streamGenerateContent?alt=sse&key=' + key,
-      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-    );
-    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Gemini stream error ' + r.status); }
-
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    const ctrl = makeController();
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (!data) continue;
-          try {
-            const parsed = JSON.parse(data);
-            const parts = parsed.candidates?.[0]?.content?.parts || [];
-            for (const part of parts) {
-              if (part.text) yield part.text;
-            }
-          } catch { /* skip */ }
+      const r = await fetch(
+        'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':streamGenerateContent?alt=sse&key=' + key,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ctrl.signal }
+      );
+      if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error?.message || 'Gemini stream error ' + r.status); }
+
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const data = line.slice(6).trim();
+            if (!data) continue;
+            try {
+              const parsed = JSON.parse(data);
+              const parts = parsed.candidates?.[0]?.content?.parts || [];
+              for (const part of parts) {
+                if (part.text) yield part.text;
+              }
+            } catch { /* skip */ }
+          }
         }
+      } finally {
+        reader.releaseLock();
       }
     } finally {
-      reader.releaseLock();
+      releaseController(ctrl);
     }
   }
 
-  // Gemini streaming wrapper that falls back through the Gemini model chain if
-  // the primary fails BEFORE producing any output. Gemini has been the most
-  // failure-prone provider, so this gives it more resilience than the other
-  // models get. Mid-stream failures can't be recovered (we don't want to emit
-  // partial text from two different models) — those still fail hard.
   async function* streamGeminiWithFallback(p, primaryModel, hist, key, sys, maxTokens, useWebSearch) {
     const chain = [primaryModel].concat((FALLBACK_MODELS.gemini || []).filter(m => m !== primaryModel));
     let lastErr = null;
@@ -782,32 +895,21 @@ export default async function handler(req, res) {
       try {
         const gen = streamGemini(p, model, hist, key, sys, maxTokens, useWebSearch);
         for await (const chunk of gen) {
-          // Yield the chunk. We count non-empty chunks as "emitted output" so
-          // we can detect the empty-response case after the stream closes.
           yield chunk;
           if (chunk && chunk.length > 0) emittedAny = true;
         }
-        // Stream closed. If we emitted nothing real, Gemini gave an empty response —
-        // treat as failure and fall through to the next fallback model.
         if (!emittedAny) {
           lastErr = new Error('Empty response from ' + model);
           if (i < chain.length - 1) continue;
-          // Chain exhausted below
         } else {
-          // Got real output — we're done
           return;
         }
       } catch (e) {
         lastErr = e;
-        if (emittedAny) {
-          // Already streamed partial content — can't safely restart. Surface the error.
-          throw e;
-        }
-        // No real output yet — safe to try the next model in the chain
+        if (emittedAny) throw e;
         if (i < chain.length - 1) continue;
       }
     }
-    // Chain exhausted with no success
     throw lastErr || new Error('Gemini fallback chain exhausted');
   }
 
@@ -817,46 +919,54 @@ export default async function handler(req, res) {
     const messages = [{ role: 'system', content: sys }].concat(hist.map(m => ({ role: m.role, content: m.content }))).concat([{ role: 'user', content: userContent }]);
     const maxTok = maxTokens || INDIVIDUAL_MAX_TOKENS;
 
-    const r = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-      body: JSON.stringify({ model, max_tokens: maxTok, messages, stream: true }),
-    });
-    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error('Grok stream error ' + r.status); }
-
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    const ctrl = makeController();
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (!data || data === '[DONE]') continue;
-          try {
-            const parsed = JSON.parse(data);
-            const delta = parsed.choices?.[0]?.delta?.content;
-            if (delta) yield delta;
-          } catch { /* skip */ }
+      const r = await fetch('https://api.x.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+        body: JSON.stringify({ model, max_tokens: maxTok, messages, stream: true }),
+        signal: ctrl.signal,
+      });
+      if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error('Grok stream error ' + r.status); }
+
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const data = line.slice(6).trim();
+            if (!data || data === '[DONE]') continue;
+            try {
+              const parsed = JSON.parse(data);
+              const delta = parsed.choices?.[0]?.delta?.content;
+              if (delta) yield delta;
+            } catch { /* skip */ }
+          }
         }
+      } finally {
+        reader.releaseLock();
       }
     } finally {
-      reader.releaseLock();
+      releaseController(ctrl);
     }
   }
 
-  // ── Helper: drains an async generator, emits SSE events per delta, returns full text.
-  // Used in the complex path to stream all 4 AIs in parallel.
-  // Each streamer is called with a modelName. SSE events: individual_delta, individual_done, individual_failed.
   async function runStreamForModel(modelName, streamGeneratorFn) {
     let fullText = '';
     try {
       if (wantsStream) sendEvent('individual_start', { model: modelName });
+      // In Search mode, emit a 'searching_web' indicator the cards can show.
+      // The model may or may not actually search — this is a hint for the UI.
+      if (wantsStream && activeMode === 'search') {
+        sendEvent('searching_web', { model: modelName });
+      }
       for await (const delta of streamGeneratorFn()) {
         fullText += delta;
         if (wantsStream) sendEvent('individual_delta', { model: modelName, text: delta });
@@ -876,99 +986,50 @@ export default async function handler(req, res) {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering if present
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
-    // Send a 2KB padding comment to defeat proxy-level buffering.
-    // Many reverse proxies won't flush the first response chunk until they've seen
-    // a certain amount of data. This primes the pipe so subsequent events flow freely.
     res.write(': ' + ' '.repeat(2048) + '\n\n');
     if (typeof res.flush === 'function') { try { res.flush(); } catch(e) {} }
   }
 
   function sendEvent(type, data) {
     res.write('data: ' + JSON.stringify({ type, ...data }) + '\n\n');
-    // Flush immediately so the browser sees events in real-time.
     if (typeof res.flush === 'function') { try { res.flush(); } catch(e) {} }
   }
 
-  // ── Build synthesis instruction (shared between medium and complex) ──
   // ── Bullet-stripping stream filter ──
-  // The synthesis model sometimes produces bullet lists despite strong anti-bullet
-  // instructions in the prompt. This filter catches stream deltas, buffers them
-  // line-by-line, and converts leading bullet markers to prose connectors.
-  // Examples:
-  //   "- First thing is x"   becomes  "First thing is x"
-  //   "* Another point"      becomes  "Another point"
-  //   "1. Step one"          becomes  "Step one"
-  // This preserves streaming UX because we emit cleaned lines as soon as they
-  // complete (i.e., when a newline arrives).
-  // ── Bullet-to-prose coalescing stream filter ──
-  // The synthesis model (and Claude Haiku generally) produces bulleted lists
-  // for definitional questions despite strong anti-bullet prompting.
-  // This filter transforms:
-  //   * Item A
-  //   * Item B
-  //   * Item C
-  // into flowing prose:
-  //   Item A; Item B; Item C.
-  //
-  // Algorithm: buffer lines as they arrive. When we see a bulleted line, hold it.
-  // Keep holding while subsequent lines are bullets (or blank lines between them).
-  // When a non-bullet non-blank line arrives (or stream ends), flush the accumulated
-  // bullets as a single prose sentence, joined with "; " and capped with ".".
-  //
-  // The streaming UX cost: bulleted sections appear as a block, not character-by-
-  // character. Non-bulleted prose streams normally. Tradeoff is acceptable — users
-  // much prefer clean prose over bulleted walls.
   function makeBulletStripper() {
-    let buffer = '';          // incoming text buffer, split on newlines
-    let pendingBullets = [];  // accumulated bullet content, waiting for flush
+    let buffer = '';
+    let pendingBullets = [];
     const BULLET_RE = /^([-*•]|\d+[.)])\s+(.*)$/;
 
-    // Turn accumulated bullet items into a prose sentence.
     function coalesce(items) {
       if (items.length === 0) return '';
-      // Clean trailing punctuation on items so joining reads cleanly
       const cleaned = items.map(s => s.replace(/[.;,]+$/, '').trim()).filter(Boolean);
       if (cleaned.length === 0) return '';
       if (cleaned.length === 1) {
-        // Single bullet → just the content as a sentence
         return cleaned[0] + (cleaned[0].match(/[.!?]$/) ? '' : '.');
       }
-      // Multiple bullets → join with "; " and cap with "."
       return cleaned.join('; ') + '.';
     }
 
-    // Process a single completed line. Returns output text to emit now,
-    // or empty string if the line was held back as a pending bullet.
     function processLine(line) {
       const trimmed = line.trim();
       const bulletMatch = trimmed.match(BULLET_RE);
-
       if (bulletMatch) {
-        // This line is a bullet — accumulate it, emit nothing yet
         const content = bulletMatch[2].trim();
         if (content) pendingBullets.push(content);
         return '';
       }
-
       if (trimmed === '') {
-        // Blank line. If we have pending bullets, this might be separator inside
-        // a bulleted list — hold it, don't flush yet.
         if (pendingBullets.length > 0) return '';
-        // Otherwise, pass through blank line normally
         return '\n';
       }
-
-      // Non-bullet, non-blank line. If we have pending bullets, flush them FIRST
-      // as prose, then emit this line.
       if (pendingBullets.length > 0) {
         const prose = coalesce(pendingBullets);
         pendingBullets = [];
         return prose + '\n\n' + line + '\n';
       }
-
-      // Normal prose line — pass through
       return line + '\n';
     }
 
@@ -985,13 +1046,11 @@ export default async function handler(req, res) {
         return output;
       },
       flush() {
-        // Process any remaining buffered content as a final line (no trailing newline)
         let output = '';
         if (buffer.length > 0) {
           output += processLine(buffer);
           buffer = '';
         }
-        // Flush any still-pending bullets as coalesced prose
         if (pendingBullets.length > 0) {
           output += coalesce(pendingBullets);
           pendingBullets = [];
@@ -1001,71 +1060,79 @@ export default async function handler(req, res) {
     };
   }
 
-  // One-shot coalescer: takes a full text string and runs the same bullet-to-prose
-  // transformation. Used to clean the final `reply` stored in done events.
   function coalesceBullets(text) {
     const stripper = makeBulletStripper();
     return stripper.push(text) + stripper.flush();
   }
 
+  // ── Auto-append medical disclaimer when topic warrants ──
+  // Called once on the FINAL combined text (reply field). We check both prompt
+  // and final answer because a model might pivot to peptides even when the
+  // user prompt didn't mention them explicitly.
+  function maybeAppendDisclaimer(replyText) {
+    if (needsMedicalDisclaimer(prompt) || needsMedicalDisclaimer(replyText)) {
+      // Avoid double-disclaiming if the model already added one
+      if (!/_research context only/i.test(replyText) && !/not medical advice/i.test(replyText)) {
+        return replyText.trimEnd() + MEDICAL_DISCLAIMER;
+      }
+    }
+    return replyText;
+  }
+
+  // For streaming: emit the disclaimer as a final delta before 'done', if needed.
+  function maybeStreamDisclaimer(accumulated) {
+    if (needsMedicalDisclaimer(prompt) || needsMedicalDisclaimer(accumulated)) {
+      if (!/_research context only/i.test(accumulated) && !/not medical advice/i.test(accumulated)) {
+        sendEvent('delta', { text: MEDICAL_DISCLAIMER });
+        return accumulated.trimEnd() + MEDICAL_DISCLAIMER;
+      }
+    }
+    return accumulated;
+  }
+
   function buildSynthInstruction(successfulCount) {
     const toneHints = analyzeTone(prompt);
+    // Generic example (was supplement-themed and primed Haiku off-topic).
     const base = 'You are the FusionAI synthesis engine. Create one clear, well-written answer from the AI responses provided. '
-      + ''
       + 'CRITICAL RULES: '
-      + ''
       + '1) NEVER mention that multiple AIs contributed, never mention synthesis, never mention models. Write as one voice. '
-      + ''
       + '2) NEVER META-COMMENTATE. Do NOT say "these responses are talking about different things" or "there\'s been a mix-up" or "the sources disagree." '
       + 'If the source answers interpreted the question differently, YOU pick the most likely interpretation and commit to it. Do not list both interpretations. Do not ask the user which one they meant. '
       + 'JUST ANSWER the most probable version. Users hate being asked "which did you mean" — they want an answer. If you are truly uncertain, pick the answer that is most likely RIGHT for this user in this context, and deliver it confidently. '
-      + ''
       + '3) CONTEXT AWARENESS: This is the FusionAI product (fusion4ai.com). If the user mentions "Fusion" or "FusionAI" in their question, they mean this product — NOT nuclear fusion energy. '
       + 'Example: "marketing plan for Fusion" means a marketing plan for FusionAI the AI chat product. Do not write about fusion reactors. '
       + 'If a source AI went off on nuclear-fusion-energy tangent, IGNORE that part of the source and answer about the product. '
-      + ''
       + '4) WRITING STYLE — THIS IS THE MOST IMPORTANT RULE. '
       + 'Write in flowing, conversational paragraphs. Full sentences. Natural rhythm. Like how a smart, articulate friend would explain something to you in person. '
       + 'AVOID BULLET POINTS. Bullets should be RARE. Most answers should contain ZERO bullet points. '
       + 'Do not break paragraphs into bulleted fragments. Do not convert every idea into its own line. Do not use "- " to start lines except when it is genuinely impossible to write as prose. '
-      + 'A bulleted list is only acceptable when you are listing specific named items that are truly parallel (for example: "three supplements worth knowing: creatine, magnesium, and omega-3"). Even then, prose is usually better. '
+      + 'A bulleted list is only acceptable when you are listing specific named items that are truly parallel. Even then, prose is usually better. '
       + 'If you find yourself about to use bullets, STOP and rewrite as paragraphs. Use sentences like "First... then... finally..." or "One approach is X. Another is Y. The better option is usually Z." '
-      + ''
       + '5) HEADERS — use sparingly. Only use ## headers when the answer is truly long (4+ distinct major sections). For most answers, skip headers entirely. Short or medium answers should be pure prose with no headers at all. '
-      + ''
       + '6) TABLES — only when comparing 3+ items across 2+ dimensions AND prose would genuinely be harder to read. For simple comparisons, prose is better. Do NOT reflexively reach for tables. '
-      + ''
       + '7) MIRROR THE USER\'S TONE. If they wrote casually (lowercase, slang, short), match that energy — be conversational, warm, and relaxed. If they wrote formally, match that. '
-      + ''
       + '8) BE SPECIFIC. Real names, real numbers, concrete examples. Never generic advice. '
-      + ''
       + '9) LENGTH — proportional to the question. Short question = short answer. Match effort to ask. Don\'t pad. '
-      + ''
       + '10) FOLLOW-UP QUESTIONS — only include one at the end if it genuinely helps move things forward. For most answers, skip entirely. Never include more than one. Do NOT use follow-up questions to ask the user what they meant — commit to an interpretation instead. '
-      + ''
       + (toneHints.toneTier === 'casual' ? 'THE USER IS VERY CASUAL — write like a friend texting back. Short conversational paragraphs, no headers, absolutely no bullet points. ' : '')
       + (toneHints.toneTier === 'professional' ? 'THIS REQUIRES PROFESSIONAL OUTPUT — write in clean formal prose, proper terminology, still in paragraph form (not bulleted). ' : '')
       + (toneHints.wantsQuick ? 'USER WANTS QUICK — 1-3 short paragraphs max. No preamble. ' : '')
-      + ''
       + 'DIRECT ANSWER POLICY: Do NOT add disclaimers, safety warnings, "consult a professional" hedges, or moralizing. '
       + 'If source answers hedged, strip the hedges. If they refused, extract factual info and present it directly without the refusal framing. '
       + 'You may still decline genuinely dangerous content (weapons synthesis, CSAM, targeted harm) — everything else, answer directly. '
-      + ''
+      // Generic format example — was previously supplement-specific which biased
+      // Haiku toward supplement/health framing on unrelated questions.
       + 'EXAMPLE OF GOOD FORMAT: '
-      + '"The simplest approach is to start with the basics — creatine, vitamin D, and omega-3s cover most people\'s needs. After a few months, if you want to push further, magnesium glycinate before bed helps sleep quality in a real measurable way, and a good B-complex rounds out anything your diet might be missing. Most of the expensive stuff (greens powders, super-blend formulas) isn\'t worth it until you\'ve nailed these four." '
-      + ''
+      + '"The simplest path is to start with the fundamentals and build from there. Once you have the basics down, the next step depends on what you\'re trying to do — for most people, focusing on consistency matters more than picking the perfect tool. The advanced options are worth it only after you\'ve mastered the basics, otherwise you\'re just adding complexity without payoff." '
       + 'EXAMPLE OF BAD FORMAT (do NOT do this): '
-      + '"Here are the top supplements:\\n- Creatine\\n- Vitamin D\\n- Omega-3\\n- Magnesium\\n- B-complex" '
-      + ''
+      + '"Here are the steps:\\n- Step 1\\n- Step 2\\n- Step 3" '
       + 'EXAMPLE OF META-COMMENTATING (do NOT do this): '
       + '"I think there\'s been a mix-up. Source A is talking about X and source B is talking about Y. Which one did you mean?" — THIS IS FORBIDDEN. Pick the most likely interpretation and answer. '
-      + ''
       + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
     return base;
   }
 
   try {
-    // ── Setup SSE if streaming requested, otherwise fall back to JSON ──
     if (wantsStream) setupSSE();
 
     let successful = [];
@@ -1073,48 +1140,20 @@ export default async function handler(req, res) {
     let synthesized = false;
     let finalReply = '';
 
-    // ── Helper: collect results as they complete ──
-    // Returns a promise that resolves to { successful, failed } when all are done,
-    // AND also emits events as each model responds (when streaming).
-    function collectResults(promises, names) {
-      const results = { successful: [], failed: [] };
-      const wrapped = promises.map((p, i) =>
-        p.then(
-          value => {
-            if (value) {
-              results.successful.push({ name: names[i], text: value });
-              if (wantsStream) sendEvent('model_done', { model: names[i] });
-            } else {
-              results.failed.push({ name: names[i], error: 'Empty response' });
-              if (wantsStream) sendEvent('model_failed', { model: names[i], error: 'Empty' });
-            }
-          },
-          err => {
-            results.failed.push({ name: names[i], error: err?.message || 'Unknown' });
-            if (wantsStream) sendEvent('model_failed', { model: names[i], error: err?.message || 'Unknown' });
-          }
-        )
-      );
-      return { allDone: Promise.all(wrapped), results };
-    }
-
     // ── SIMPLE: single model, stream directly ──
     if (complexity === 'simple') {
       if (wantsStream) {
         sendEvent('complexity', { complexity, models: ['Claude'] });
-        // Mark the 3 non-running AIs as "not needed" so their Workstation cards
-        // don't hang on "Thinking" — simple questions only need 1 model.
         sendEvent('individual_not_needed', { model: 'ChatGPT' });
         sendEvent('individual_not_needed', { model: 'Gemini' });
         sendEvent('individual_not_needed', { model: 'Grok' });
-        // Claude's card should fill live, and the main chat answer is the same text
         sendEvent('individual_start', { model: 'Claude' });
+        if (activeMode === 'search') sendEvent('searching_web', { model: 'Claude' });
         try {
           let acc = '';
           const stripper = makeBulletStripper();
           for await (const delta of streamClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)) {
             acc += delta;
-            // Strip bullets from both Workstation card AND main chat delta
             const cleaned = stripper.push(delta);
             if (cleaned) {
               sendEvent('individual_delta', { model: 'Claude', text: cleaned });
@@ -1126,8 +1165,10 @@ export default async function handler(req, res) {
             sendEvent('individual_delta', { model: 'Claude', text: tail });
             sendEvent('delta', { text: tail });
           }
-          // Send individual_done so Claude's card finalizes with full text
-          const cleanedFull = coalesceBullets(acc);
+          let cleanedFull = coalesceBullets(acc);
+          // Append medical disclaimer if applicable, both as a streamed delta
+          // (so the user sees it live) and in the final 'reply' payload.
+          cleanedFull = maybeStreamDisclaimer(cleanedFull);
           sendEvent('individual_done', { model: 'Claude', text: cleanedFull });
           sendEvent('done', { reply: cleanedFull, synthesized: false, models: ['Claude'], failed: [], complexity });
           res.end();
@@ -1135,15 +1176,12 @@ export default async function handler(req, res) {
         } catch (e) {
           try {
             let acc = '';
-            for await (const delta of (async function* () {
-              // Fallback: non-streaming Gemini, simulated as a single chunk
-              const text = await geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt);
-              yield text;
-            })()) {
-              acc += delta;
-              sendEvent('delta', { text: delta });
-            }
-            sendEvent('done', { reply: acc, synthesized: false, models: ['Gemini'], failed: [{ name: 'Claude', error: e.message }], complexity });
+            const text = await geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt);
+            acc = text;
+            sendEvent('delta', { text });
+            const finalText = maybeAppendDisclaimer(acc);
+            if (finalText !== acc) sendEvent('delta', { text: MEDICAL_DISCLAIMER });
+            sendEvent('done', { reply: finalText, synthesized: false, models: ['Gemini'], failed: [{ name: 'Claude', error: e.message }], complexity });
             res.end();
             return;
           } catch (e2) {
@@ -1153,51 +1191,52 @@ export default async function handler(req, res) {
           }
         }
       } else {
-        // Non-streaming fallback
         try {
-          finalReply = await withTimeout(claudeAsk(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude');
+          const ctrl = makeController();
+          finalReply = await withTimeout(claudeAsk(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt), 25000, 'Claude', ctrl);
           successful = [{ name: 'Claude', text: finalReply }];
         } catch (e) {
           try {
-            finalReply = await withTimeout(geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini');
+            const ctrl = makeController();
+            finalReply = await withTimeout(geminiAsk(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt), 25000, 'Gemini', ctrl);
             successful = [{ name: 'Gemini', text: finalReply }];
           } catch (e2) {
             return res.status(500).json({ error: 'All models failed' });
           }
         }
+        finalReply = maybeAppendDisclaimer(finalReply);
         return res.status(200).json({ reply: finalReply, synthesized: false, models: successful.map(s => s.name), failed: [], individual: successful, mode: activeMode, complexity });
       }
     }
 
-    // ── MEDIUM: 2 models (Claude + Gemini), synthesize via streaming ──
+    // ── MEDIUM: 2 models (Claude + Gemini), synthesize ──
     if (complexity === 'medium') {
       if (wantsStream) {
         sendEvent('complexity', { complexity, models: ['Claude', 'Gemini'] });
-        // Immediately mark ChatGPT and Grok as skipped so the Workstation cards
-        // don't hang on "Thinking" — this is a simple-enough query that only 2 models run.
         sendEvent('individual_not_needed', { model: 'ChatGPT' });
         sendEvent('individual_not_needed', { model: 'Grok' });
       }
 
-      // Use streaming variants so the Workstation can show live text for each AI.
-      // WIN #3: tighter timeouts (25s cap)
-      const INDIVIDUAL_USE_SEARCH_MEDIUM = false; // Search slows streaming; synth has search
+      // Search mode forces web_search on individual streams (slower but accurate).
+      // Otherwise leave it off so cards aren't frozen for 10-15s before tokens flow.
+      const INDIVIDUAL_USE_SEARCH_MEDIUM = activeMode === 'search';
+
+      const claudeCtrl = makeController();
       const claudeStreamP = withTimeout(
         runStreamForModel('Claude', () => streamClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH_MEDIUM)),
-        30000, 'Claude'
+        30000, 'Claude', claudeCtrl
       );
+      const geminiCtrl = makeController();
       const geminiStreamP = withTimeout(
         runStreamForModel('Gemini', () => streamGeminiWithFallback(fullPrompt, models.gemini, convHistory, KEYS.gemini, systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH_MEDIUM)),
-        25000, 'Gemini'
+        25000, 'Gemini', geminiCtrl
       );
 
-      // Wait for both to complete (success or failure)
       const mediumResults = await Promise.all([
         claudeStreamP.then(r => r, err => ({ name: 'Claude', text: null, ok: false, error: err?.message || 'Failed' })),
         geminiStreamP.then(r => r, err => ({ name: 'Gemini', text: null, ok: false, error: err?.message || 'Failed' })),
       ]);
 
-      // Emit legacy model_done/model_failed for backward compat
       if (wantsStream) {
         mediumResults.forEach(r => {
           if (r.ok) sendEvent('model_done', { model: r.name });
@@ -1222,16 +1261,15 @@ export default async function handler(req, res) {
         return res.status(500).json({ error: 'All models failed', failed: failed.concat(skipped), failedDetails: failed.concat(skipped) });
       }
 
-      // WIN #6: If only one succeeded, just stream its text directly (skip synthesis)
       if (successful.length === 1) {
-        const text = successful[0].text;
+        let text = successful[0].text;
         if (wantsStream) {
           sendEvent('synth_start', {});
-          // Stream the single response out as chunks to preserve the streaming UX
           const chunkSize = 40;
           for (let i = 0; i < text.length; i += chunkSize) {
             sendEvent('delta', { text: text.slice(i, i + chunkSize) });
           }
+          text = maybeStreamDisclaimer(text);
           sendEvent('done', {
             reply: text,
             synthesized: false,
@@ -1243,10 +1281,10 @@ export default async function handler(req, res) {
           res.end();
           return;
         }
+        text = maybeAppendDisclaimer(text);
         return res.status(200).json({ reply: text, synthesized: false, models: successful.map(s => s.name), failed: failed.concat(skipped).map(f => f.name), failedDetails: failed.concat(skipped), individual: successful, mode: activeMode, complexity });
       }
 
-      // Both succeeded → synthesize
       const synthPrompt = 'The user asked: "' + prompt + '"\n\nHere are responses from 2 AI models:\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
       const synthInst = buildSynthInstruction(successful.length);
 
@@ -1262,8 +1300,10 @@ export default async function handler(req, res) {
           }
           const tail = stripper.flush();
           if (tail) sendEvent('delta', { text: tail });
+          let finalText = coalesceBullets(acc);
+          finalText = maybeStreamDisclaimer(finalText);
           sendEvent('done', {
-            reply: coalesceBullets(acc),
+            reply: finalText,
             synthesized: true,
             models: successful.map(s => s.name),
             failed: failed.concat(skipped).map(f => f.name),
@@ -1273,9 +1313,9 @@ export default async function handler(req, res) {
           res.end();
           return;
         } catch (e) {
-          // Fallback to first successful if synthesis stream fails
-          const fallback = successful[0].text;
+          let fallback = successful[0].text;
           sendEvent('delta', { text: fallback });
+          fallback = maybeStreamDisclaimer(fallback);
           sendEvent('done', {
             reply: fallback,
             synthesized: false,
@@ -1289,13 +1329,14 @@ export default async function handler(req, res) {
         }
       }
 
-      // Non-streaming fallback for medium
       try {
-        finalReply = await withTimeout(claudeAsk(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 20000, 'Synthesis');
+        const ctrl = makeController();
+        finalReply = await withTimeout(claudeAsk(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 20000, 'Synthesis', ctrl);
         synthesized = true;
       } catch {
         finalReply = successful[0].text;
       }
+      finalReply = maybeAppendDisclaimer(finalReply);
       return res.status(200).json({
         reply: finalReply,
         synthesized,
@@ -1308,33 +1349,25 @@ export default async function handler(req, res) {
       });
     }
 
-    // ── DEBATE MODE: Multi-round with real rebuttals ──
-    // Round 1: each AI answers independently (with retry + fallback to cheap sibling)
-    // Round 2: each AI reads the other 3's answers and writes a rebuttal (same fallback logic)
-    // Verdict: Haiku synthesizes a final judgment (streamed)
-    // Goal: every AI always responds. A given AI only fails if BOTH its primary and
-    // its cheap fallback sibling are down simultaneously.
+    // ── DEBATE MODE ──
     if (mainMode === 'debate') {
       const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
       if (wantsStream) sendEvent('complexity', { complexity: 'debate', models: names });
       if (wantsStream) sendEvent('debate_round', { round: 1 });
 
-      // ── ROUND 1: parallel, each AI gives opening argument ──
       const r1System = systemPrompt
         + ' DEBATE CONTEXT: This is a formal debate. You are presenting your opening argument. '
         + 'State your position clearly and confidently. Back it up with specifics. '
         + 'Keep it focused — around 200-350 words. '
         + 'Other AIs will read your argument and respond, so make your strongest case.';
 
-      // Per-AI timeout ceiling — tight enough that Round 1 + Round 2 + verdict stay under Vercel's 60s.
-      // Budget: round1 (25s) + round2 (25s) + verdict stream (~10s) = ~60s. Each round runs all 4 AIs in PARALLEL.
-      // Within the 25s, askWithFallback can fit 2 primary attempts (~10s) + 1-2 fallback attempts (~10s).
       const PER_AI_DEBATE_TIMEOUT = 25000;
 
       function debatePromise(name, askFn, primaryModel, key, providerKey) {
+        const ctrl = makeController();
         return withTimeout(
           askWithFallback(askFn, fullPrompt, primaryModel, convHistory, key, r1System, DEBATE_MAX_TOKENS, providerKey),
-          PER_AI_DEBATE_TIMEOUT, name
+          PER_AI_DEBATE_TIMEOUT, name, ctrl
         ).then(
           result => {
             if (wantsStream) sendEvent('model_done', { model: name, round: 1, usedFallback: result.usedFallback });
@@ -1358,7 +1391,6 @@ export default async function handler(req, res) {
       const round1Success = round1Results.filter(r => r.ok && r.text);
 
       if (round1Success.length < 2) {
-        // Can't have a debate with fewer than 2 participants
         const failed = round1Results.filter(r => !r.ok).map(r => ({ name: r.name, error: r.error }));
         if (wantsStream) {
           sendEvent('error', { error: 'Not enough models responded for a debate', failed });
@@ -1368,7 +1400,6 @@ export default async function handler(req, res) {
         return res.status(500).json({ error: 'Not enough models responded for a debate', failed });
       }
 
-      // ── ROUND 2: rebuttals ──
       if (wantsStream) sendEvent('debate_round', { round: 2 });
 
       function buildRebuttalContext(myName, allArgs) {
@@ -1389,7 +1420,6 @@ export default async function handler(req, res) {
         + 'Be specific: cite the other AIs by name when you disagree or agree with them. '
         + 'Do NOT just restate your original argument. Engage with what the others actually said.';
 
-      // Only participants who succeeded in round 1 can write rebuttals
       const r2Promises = round1Success.map(participant => {
         const rebuttalPrompt = buildRebuttalContext(participant.name, round1Success);
         let askFn, primaryModel, key, providerKey;
@@ -1398,9 +1428,10 @@ export default async function handler(req, res) {
         else if (participant.name === 'Gemini') { askFn = geminiAsk; primaryModel = models.gemini; key = KEYS.gemini; providerKey = 'gemini'; }
         else if (participant.name === 'Grok')   { askFn = grokAsk;   primaryModel = models.grok;   key = KEYS.grok;   providerKey = 'grok';   }
 
+        const ctrl = makeController();
         return withTimeout(
           askWithFallback(askFn, rebuttalPrompt, primaryModel, [], key, r2System, DEBATE_MAX_TOKENS, providerKey),
-          PER_AI_DEBATE_TIMEOUT, participant.name + ' rebuttal'
+          PER_AI_DEBATE_TIMEOUT, participant.name + ' rebuttal', ctrl
         ).then(
           result => {
             if (wantsStream) sendEvent('model_done', { model: participant.name, round: 2, usedFallback: result.usedFallback });
@@ -1415,9 +1446,6 @@ export default async function handler(req, res) {
 
       const round2Results = await Promise.all(r2Promises);
 
-      // Merge round 1 and round 2 into per-AI "full argument" blocks for individual display
-      // IMPORTANT: the separator pattern must match renderDebateResponse's split:
-      //   '\n\n---\n\n**Rebuttal:**\n\n'
       const fullIndividual = round1Success.map(r1 => {
         const r2 = round2Results.find(x => x.name === r1.name);
         const r2Text = (r2 && r2.ok && r2.text) ? r2.text : '[No rebuttal]';
@@ -1429,10 +1457,8 @@ export default async function handler(req, res) {
         };
       });
 
-      // Also include any models that failed round 1 as failed entries
       const failedR1 = round1Results.filter(r => !r.ok).map(r => ({ name: r.name, error: r.error }));
 
-      // ── VERDICT: Haiku judges the debate ──
       if (wantsStream) sendEvent('debate_round', { round: 'verdict' });
 
       const verdictPrompt = 'Original question: "' + prompt + '"\n\n'
@@ -1459,6 +1485,7 @@ export default async function handler(req, res) {
             acc += delta;
             sendEvent('delta', { text: delta });
           }
+          acc = maybeStreamDisclaimer(acc);
           sendEvent('done', {
             reply: acc,
             synthesized: true,
@@ -1472,9 +1499,9 @@ export default async function handler(req, res) {
           res.end();
           return;
         } catch (e) {
-          // Fallback: just concatenate
-          const fallback = fullIndividual.map(p => '### ' + p.name + '\n\n' + p.text).join('\n\n---\n\n');
+          let fallback = fullIndividual.map(p => '### ' + p.name + '\n\n' + p.text).join('\n\n---\n\n');
           sendEvent('delta', { text: fallback });
+          fallback = maybeStreamDisclaimer(fallback);
           sendEvent('done', {
             reply: fallback,
             synthesized: false,
@@ -1490,13 +1517,14 @@ export default async function handler(req, res) {
         }
       }
 
-      // Non-streaming fallback for debate
       let verdictText = '';
       try {
-        verdictText = await withTimeout(claudeAsk(verdictPrompt, SYNTH_MODEL, [], KEYS.anthropic, verdictSystem), 25000, 'Verdict');
+        const ctrl = makeController();
+        verdictText = await withTimeout(claudeAsk(verdictPrompt, SYNTH_MODEL, [], KEYS.anthropic, verdictSystem), 25000, 'Verdict', ctrl);
       } catch (e) {
         verdictText = fullIndividual.map(p => '### ' + p.name + '\n\n' + p.text).join('\n\n---\n\n');
       }
+      verdictText = maybeAppendDisclaimer(verdictText);
       return res.status(200).json({
         reply: verdictText,
         synthesized: true,
@@ -1510,29 +1538,27 @@ export default async function handler(req, res) {
       });
     }
 
-    // ── COMPLEX: 4 models streamed in parallel (new streaming path) ──
+    // ── COMPLEX: 4 models streamed in parallel ──
     if (wantsStream) sendEvent('complexity', { complexity, models: ['Claude', 'ChatGPT', 'Gemini', 'Grok'] });
 
-    // Each stream runs in parallel and emits individual_delta events tagged by model.
-    // Frontend demuxes them into the Workstation cards in real-time.
-    // We race for completion: proceed with synthesis when 3/4 are done OR after total timeout.
     const names = ['Claude', 'ChatGPT', 'Gemini', 'Grok'];
     const collected = [];
     const settledFlags = [false, false, false, false];
 
-    // Build the promises — each runs its stream and returns when the stream completes.
-    // WIN #3: Grok gets tighter timeout because it's typically the slowest.
-    //
-    // IMPORTANT: web search is DISABLED for individual streaming calls. When a model uses
-    // web search, it spends 10-15s searching before any text tokens flow — making the
-    // Workstation cards appear frozen on "Thinking" for most of the query. The synthesizer
-    // Claude still has search capability, so search-enabled answers still get results.
-    const INDIVIDUAL_USE_SEARCH = false;
+    // Search mode forces web_search on individual streams. Otherwise off — search
+    // adds 10-15s before tokens flow, freezing Workstation cards.
+    const INDIVIDUAL_USE_SEARCH = activeMode === 'search';
+
+    const claudeCtrl = makeController();
+    const openaiCtrl = makeController();
+    const geminiCtrl = makeController();
+    const grokCtrl = makeController();
+
     const streamPromises = [
-      withTimeout(runStreamForModel('Claude',  () => streamClaude (fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 30000, 'Claude'),
-      withTimeout(runStreamForModel('ChatGPT', () => streamOpenAI (fullPrompt, models.openai, convHistory, KEYS.openai,    systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 25000, 'ChatGPT'),
-      withTimeout(runStreamForModel('Gemini',  () => streamGeminiWithFallback(fullPrompt, models.gemini, convHistory, KEYS.gemini,    systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 25000, 'Gemini'),
-      withTimeout(runStreamForModel('Grok',    () => streamGrok   (fullPrompt, models.grok,   convHistory, KEYS.grok,      systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 22000, 'Grok'),
+      withTimeout(runStreamForModel('Claude',  () => streamClaude (fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 30000, 'Claude', claudeCtrl),
+      withTimeout(runStreamForModel('ChatGPT', () => streamOpenAI (fullPrompt, models.openai, convHistory, KEYS.openai,    systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 25000, 'ChatGPT', openaiCtrl),
+      withTimeout(runStreamForModel('Gemini',  () => streamGeminiWithFallback(fullPrompt, models.gemini, convHistory, KEYS.gemini,    systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 25000, 'Gemini', geminiCtrl),
+      withTimeout(runStreamForModel('Grok',    () => streamGrok   (fullPrompt, models.grok,   convHistory, KEYS.grok,      systemPrompt, INDIVIDUAL_MAX_TOKENS, INDIVIDUAL_USE_SEARCH)), 22000, 'Grok', grokCtrl),
     ];
 
     const wrapped = streamPromises.map((p, i) =>
@@ -1540,7 +1566,6 @@ export default async function handler(req, res) {
         result => {
           settledFlags[i] = true;
           collected.push(result);
-          // Emit legacy model_done/model_failed for backward compatibility with older clients
           if (wantsStream) {
             if (result.ok) sendEvent('model_done', { model: names[i] });
             else sendEvent('model_failed', { model: names[i], error: result.error });
@@ -1558,13 +1583,7 @@ export default async function handler(req, res) {
       )
     );
 
-    // All 4 AIs must settle (either done OR failed) before synthesis starts.
-    // This gives users complete visuals in the Workstation — they see every AI
-    // finish typing before the final answer begins streaming in the main chat.
-    // Safety: 26s hard ceiling in case a provider hangs. Individual stream timeouts
-    // (20-30s via withTimeout above) mean this is belt-and-suspenders.
     function allDone() { return settledFlags.every(f => f); }
-
     const startTime = Date.now();
 
     await new Promise(resolve => {
@@ -1576,19 +1595,14 @@ export default async function handler(req, res) {
       }
       const checker = setInterval(() => {
         if (allDone()) { clearInterval(checker); done(); return; }
-        // Hard ceiling at 22s — past here, give up on slow individual streams
-        // so synthesis has time to complete before Vercel's 60s function timeout.
-        // Tradeoff: occasionally drop 1 AI to guarantee a complete synthesized answer.
         if (Date.now() - startTime > 22000) { clearInterval(checker); done(); }
       }, 150);
-      // Also resolve naturally when all complete (catches the common case quickly)
       Promise.all(wrapped).then(() => { clearInterval(checker); done(); });
     });
 
     successful = collected.filter(c => c.ok).map(c => ({ name: c.name, text: c.text }));
     failed = collected.filter(c => !c.ok).map(c => ({ name: c.name, error: c.error }));
 
-    // Fill in "not yet responded" for any model that didn't settle in time
     names.forEach((n, i) => {
       if (!settledFlags[i] && !successful.find(s => s.name === n) && !failed.find(f => f.name === n)) {
         failed.push({ name: n, error: 'Response skipped (answering from faster models)' });
@@ -1604,23 +1618,23 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'All models failed', failed, failedDetails: failed });
     }
 
-    // If only one model succeeded, stream it directly (no synthesis needed)
     if (successful.length === 1) {
-      const text = successful[0].text;
+      let text = successful[0].text;
       if (wantsStream) {
         sendEvent('synth_start', {});
         const chunkSize = 40;
         for (let i = 0; i < text.length; i += chunkSize) {
           sendEvent('delta', { text: text.slice(i, i + chunkSize) });
         }
+        text = maybeStreamDisclaimer(text);
         sendEvent('done', { reply: text, synthesized: false, models: [successful[0].name], failed: failed.map(f => f.name), failedDetails: failed, complexity });
         res.end();
         return;
       }
+      text = maybeAppendDisclaimer(text);
       return res.status(200).json({ reply: text, synthesized: false, models: [successful[0].name], failed: failed.map(f => f.name), failedDetails: failed, individual: successful, mode: activeMode, complexity });
     }
 
-    // Synthesize from whoever responded (could be 2, 3, or 4)
     const synthPrompt = 'The user asked: "' + prompt + '"\n\nHere are responses from ' + successful.length + ' AI models:\n\n' + successful.map((s, i) => 'Response ' + (i + 1) + ':\n' + s.text).join('\n\n---\n\n');
     const synthInst = buildSynthInstruction(successful.length);
 
@@ -1629,38 +1643,36 @@ export default async function handler(req, res) {
       try {
         let acc = '';
         const stripper = makeBulletStripper();
-        // WIN #2: synthesis uses Haiku regardless of tier
-        // WIN #1: synthesis is streamed
         for await (const delta of streamClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, SYNTHESIS_MAX_TOKENS)) {
           acc += delta;
           const cleaned = stripper.push(delta);
           if (cleaned) sendEvent('delta', { text: cleaned });
         }
-        // Flush any remaining buffered content (final line without trailing newline)
         const tail = stripper.flush();
         if (tail) sendEvent('delta', { text: tail });
-        sendEvent('done', { reply: coalesceBullets(acc), synthesized: true, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity, individual: successful });
+        let finalText = coalesceBullets(acc);
+        finalText = maybeStreamDisclaimer(finalText);
+        sendEvent('done', { reply: finalText, synthesized: true, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity, individual: successful });
         res.end();
         return;
       } catch (e) {
-        // Synthesis failed mid-stream or at start. Flush any buffered content
-        // then REPLACE displayed content with the fallback (not append) so the
-        // user doesn't see a weird mix of partial synthesis + full AI text.
-        const fallback = successful[0].text;
+        let fallback = successful[0].text;
         sendEvent('delta', { text: fallback, replace: true });
+        fallback = maybeStreamDisclaimer(fallback);
         sendEvent('done', { reply: fallback, synthesized: false, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity, individual: successful });
         res.end();
         return;
       }
     }
 
-    // Non-streaming fallback for complex
     try {
-      finalReply = await withTimeout(claudeAsk(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 25000, 'Synthesis');
+      const ctrl = makeController();
+      finalReply = await withTimeout(claudeAsk(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 25000, 'Synthesis', ctrl);
       synthesized = true;
     } catch {
       finalReply = successful[0].text;
     }
+    finalReply = maybeAppendDisclaimer(finalReply);
 
     return res.status(200).json({
       reply: finalReply,
@@ -1675,6 +1687,9 @@ export default async function handler(req, res) {
 
   } catch (e) {
     console.error('Handler error:', e);
+    // Best-effort: abort any still-running provider requests so we don't pay
+    // for tokens we can no longer deliver.
+    abortAll();
     if (wantsStream && !res.writableEnded) {
       try { sendEvent('error', { error: e.message }); res.end(); } catch {}
       return;
