@@ -1085,6 +1085,39 @@ export default async function handler(req, res) {
     return stripper.push(text) + stripper.flush();
   }
 
+  // ── Paragraph break insertion safety net ──
+  // If the synthesizer ignores the "break into paragraphs" rule and produces
+  // a wall of text, this inserts breaks at natural sentence boundaries every
+  // 3-4 sentences so the response is readable. Only triggers when there's a
+  // long block (>= 350 chars) without any existing paragraph breaks — we don't
+  // want to disrupt content that's already well-formatted.
+  function ensureParagraphBreaks(text) {
+    if (!text) return text;
+    // Split into existing paragraph blocks
+    const blocks = text.split(/\n\s*\n/);
+    const fixed = blocks.map(block => {
+      const trimmed = block.trim();
+      if (trimmed.length < 350) return block; // small enough already
+      // Don't touch blocks that look like lists, code, headers, or quotes
+      if (/^[\-*•]/m.test(trimmed)) return block;
+      if (/^#{1,6}\s/m.test(trimmed)) return block;
+      if (/```/.test(trimmed)) return block;
+      if (/^>/m.test(trimmed)) return block;
+      // Split into sentences using rough boundary detection
+      // (capture sentence-ending punctuation followed by whitespace + capital)
+      const sentences = trimmed.split(/(?<=[.!?])\s+(?=[A-Z"'])/);
+      if (sentences.length < 5) return block; // not enough sentences to break
+      // Group into paragraphs of 3-4 sentences each
+      const paras = [];
+      const targetSize = sentences.length >= 9 ? 4 : 3;
+      for (let i = 0; i < sentences.length; i += targetSize) {
+        paras.push(sentences.slice(i, i + targetSize).join(' '));
+      }
+      return paras.join('\n\n');
+    });
+    return fixed.join('\n\n');
+  }
+
   // ── Auto-append medical disclaimer when topic warrants ──
   // Called once on the FINAL combined text (reply field). We check both prompt
   // and final answer because a model might pivot to peptides even when the
@@ -1233,6 +1266,12 @@ export default async function handler(req, res) {
       + 'If a source AI went off on nuclear-fusion-energy tangent, IGNORE that part of the source and answer about the product. '
       + '4) WRITING STYLE — THIS IS THE MOST IMPORTANT RULE. '
       + 'Write in flowing, conversational paragraphs. Full sentences. Natural rhythm. Like how a smart, articulate friend would explain something to you in person. '
+      + 'BREAK INTO PARAGRAPHS. Every 3-4 sentences, start a new paragraph by inserting a blank line (two newlines). '
+      + 'A wall of text with no paragraph breaks is unreadable — it doesn\'t matter how good the prose is, the user gives up. '
+      + 'When you change topic, when you finish one point and move to the next, when you would naturally pause for breath in conversation — that is where you put a paragraph break. '
+      + 'For any answer over ~80 words, you MUST have at least 2-3 paragraphs separated by blank lines. Single-paragraph answers over 80 words are FORBIDDEN. '
+      + 'EXAMPLE OF GOOD PARAGRAPHING: "First paragraph covers the main point in 3-4 sentences and ends with a clear thought.\\n\\nSecond paragraph covers the next point or angle. It picks up from the first but moves the discussion forward.\\n\\nThird paragraph wraps up or adds a final consideration." '
+      + 'EXAMPLE OF BAD WALL-OF-TEXT (do NOT do this): One giant paragraph that runs 200+ words without any breaks, where every sentence just keeps going and the reader has nowhere to rest their eyes. '
       + 'AVOID BULLET POINTS. Bullets should be RARE. Most answers should contain ZERO bullet points. '
       + 'Do not break paragraphs into bulleted fragments. Do not convert every idea into its own line. Do not use "- " to start lines except when it is genuinely impossible to write as prose. '
       + 'A bulleted list is only acceptable when you are listing specific named items that are truly parallel. Even then, prose is usually better. '
@@ -1461,6 +1500,7 @@ export default async function handler(req, res) {
           if (tail) sendEvent('delta', { text: tail });
           let finalText = coalesceBullets(acc);
           finalText = stripModelLeakage(finalText);
+          finalText = ensureParagraphBreaks(finalText);
           finalText = maybeStreamDisclaimer(finalText);
           sendEvent('done', {
             reply: finalText,
@@ -1497,6 +1537,7 @@ export default async function handler(req, res) {
         finalReply = successful[0].text;
       }
       finalReply = stripModelLeakage(finalReply);
+      finalReply = ensureParagraphBreaks(finalReply);
       finalReply = maybeAppendDisclaimer(finalReply);
       return res.status(200).json({
         reply: finalReply,
@@ -1823,6 +1864,7 @@ export default async function handler(req, res) {
         if (tail) sendEvent('delta', { text: tail });
         let finalText = coalesceBullets(acc);
         finalText = stripModelLeakage(finalText);
+        finalText = ensureParagraphBreaks(finalText);
         finalText = maybeStreamDisclaimer(finalText);
         sendEvent('done', { reply: finalText, synthesized: true, models: successful.map(s => s.name), failed: failed.map(f => f.name), failedDetails: failed, complexity, individual: successful });
         res.end();
@@ -1845,6 +1887,7 @@ export default async function handler(req, res) {
       finalReply = successful[0].text;
     }
     finalReply = stripModelLeakage(finalReply);
+    finalReply = ensureParagraphBreaks(finalReply);
     finalReply = maybeAppendDisclaimer(finalReply);
 
     return res.status(200).json({
