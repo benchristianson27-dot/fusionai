@@ -1018,10 +1018,15 @@ export default async function handler(req, res) {
   }
 
   // ── Bullet-stripping stream filter ──
+  // Coalesces unordered bullet lists (-, *, •) into prose since users prefer
+  // flowing text. Numbered lists (1. 2. 3.) are PRESERVED — when a user asks
+  // "number these" they explicitly want a numbered list, and we shouldn't
+  // collapse it. Same for steps in a recipe, ranking lists, etc. — numbers
+  // signal intentional ordering, bullets signal lazy formatting.
   function makeBulletStripper() {
     let buffer = '';
     let pendingBullets = [];
-    const BULLET_RE = /^([-*•]|\d+[.)])\s+(.*)$/;
+    const BULLET_RE = /^([-*•])\s+(.*)$/;  // unordered bullets only — no \d+
 
     function coalesce(items) {
       if (items.length === 0) return '';
@@ -1100,6 +1105,7 @@ export default async function handler(req, res) {
       if (trimmed.length < 350) return block; // small enough already
       // Don't touch blocks that look like lists, code, headers, or quotes
       if (/^[\-*•]/m.test(trimmed)) return block;
+      if (/^\d+[.)]\s/m.test(trimmed)) return block;  // numbered list
       if (/^#{1,6}\s/m.test(trimmed)) return block;
       if (/```/.test(trimmed)) return block;
       if (/^>/m.test(trimmed)) return block;
@@ -1196,6 +1202,82 @@ export default async function handler(req, res) {
       }
       return s;
     });
+  }
+
+  // ── Edit-mode detection ──
+  // When the user's current message is a short modification request like
+  // "make it shorter", "number them", "rewrite in X style", "no like Y",
+  // they want to EDIT the prior assistant response, not generate fresh content.
+  // Without this, the synthesizer drifts: Round 1 asks for sentences using vocab
+  // words, Round 2 says "number these" → synth produces definitions instead of
+  // the original sentences. The original task gets lost.
+  //
+  // Detection looks at:
+  //   • Current message length (short → likely a tweak)
+  //   • Pronouns like "them/these/it/this" without a clear noun
+  //   • Modification verbs: "shorter", "longer", "number", "list", "rewrite",
+  //     "make it X", "in Y style", "but Z", "no Z", "without W"
+  //
+  // When detected, we extract the prior assistant message AND the original
+  // user request (the first task in the chat) and pass both to the synth so
+  // it edits the prior content while keeping the original task constraints.
+  function detectEditRequest(currentPrompt, history) {
+    if (!Array.isArray(history) || history.length < 2) return null;
+    const trimmed = (currentPrompt || '').trim();
+    if (!trimmed || trimmed.length > 200) return null;
+    const lower = trimmed.toLowerCase();
+
+    // Find the most recent assistant message
+    let priorAssistant = null;
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (history[i].role === 'assistant' && history[i].content) {
+        priorAssistant = history[i].content;
+        break;
+      }
+    }
+    if (!priorAssistant || priorAssistant.length < 50) return null;
+
+    // Find the earliest user message (the "original task") — usually the first
+    // detailed user message in the conversation
+    let originalTask = null;
+    for (let i = 0; i < history.length; i++) {
+      if (history[i].role === 'user' && history[i].content && history[i].content.length > 30) {
+        originalTask = history[i].content;
+        break;
+      }
+    }
+
+    // Edit-request signals (any one is enough if message is short)
+    const editPatterns = [
+      /\b(make|keep)\s+(it|them|these|that|this)\s+(short|shorter|long|longer|brief|smaller|bigger|simpler|cleaner|tighter|nicer|better|more|less)/i,
+      /\b(number|list|bullet|format|reformat|reword|rewrite|redo|fix|change|edit|adjust|tweak|update)\s+(it|them|these|that|this|each|every|all)/i,
+      /\b(number|list|bullet|format|bulletpoint|bullet point)\s+each/i,
+      /^(no|nope|not|don'?t)\s+/i,
+      /^(yes|yeah|yep|do|please|now|but|and|also|just|actually|instead|wait)\s+/i,
+      /\b(in|with|using|like)\s+(a|an|the)?\s*(short|long|shorter|longer|teen|professional|casual|formal|funny|simple|complex|kid|adult)\s*(form|tone|voice|style|version|way)/i,
+      /\b(write|sound|talk|act|be)\s+like\s+(a|an|the)/i,
+      /^(shorter|longer|number them|number these|number each|list them|list these|make.{0,30}list|bullet)/i,
+      /\b(remove|take out|delete|cut|strip|drop)\s+(the|all|those|that|this|every)/i,
+      /\b(add|include|put|insert)\s+/i,
+      /\b(combine|merge|split|separate)\s+/i,
+    ];
+    const isEditRequest = editPatterns.some(rx => rx.test(lower));
+    // Also: very short messages (<= 8 words) following a long assistant response
+    // are usually edit requests IF they contain referring pronouns. Without the
+    // pronoun check, "how do i make a sandwich" (a fresh question) would be
+    // misclassified as an edit. With it, "make them shorter" / "no, like that"
+    // / "do it again" still trigger.
+    const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
+    const hasReferringPronoun = /\b(it|them|these|those|this|that|each|all|both)\b/i.test(lower);
+    const isShortFollowup = wordCount <= 8 && hasReferringPronoun && priorAssistant.length > 200;
+
+    if (!isEditRequest && !isShortFollowup) return null;
+
+    return {
+      priorAssistant: priorAssistant,
+      originalTask: originalTask,
+      modificationRequest: trimmed,
+    };
   }
 
   // ── Strip model-leak phrases from synth output ──
@@ -1481,9 +1563,26 @@ export default async function handler(req, res) {
 
       const synthSources = scrubSourcesForSynthesis(successful);
       const allRefusedM = synthSources.every(s => s.wasRefusal);
-      const synthPrompt = allRefusedM
-        ? 'The user asked: "' + prompt + '"\n\nAll source AI responses were refusals. Ignore them. Answer the user\'s question yourself, completely and helpfully, using your own knowledge. Produce the actual deliverable they asked for.'
-        : 'The user asked: "' + prompt + '"\n\nBelow are draft answers to the question. Combine them into one final answer in your own voice. NEVER refer to "the responses", "the sources", "Response 1", "Response 2", etc. Just write the final answer.\n\n' + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
+      const editCtxM = detectEditRequest(prompt, convHistory);
+      let synthPrompt;
+      if (allRefusedM) {
+        synthPrompt = 'The user asked: "' + prompt + '"\n\nAll source AI responses were refusals. Ignore them. Answer the user\'s question yourself, completely and helpfully, using your own knowledge. Produce the actual deliverable they asked for.';
+      } else if (editCtxM) {
+        // Edit mode: the user wants to modify the prior assistant response.
+        // Pass the prior content as the BASE and the modification request as
+        // the instruction. The drafts from the round-1 models are still useful
+        // (they may have applied the edit successfully) but we frame the task
+        // as editing, not generating from scratch.
+        synthPrompt = 'EDIT MODE — The user is asking you to modify a previous response, not generate fresh content.\n\n'
+          + (editCtxM.originalTask ? 'ORIGINAL TASK (still applies — do not lose this constraint):\n' + editCtxM.originalTask + '\n\n' : '')
+          + 'PREVIOUS RESPONSE (this is the BASE CONTENT — preserve its substance, only apply the requested modification):\n═══ BASE ═══\n' + editCtxM.priorAssistant + '\n═══════════\n\n'
+          + 'USER\'S MODIFICATION REQUEST:\n"' + editCtxM.modificationRequest + '"\n\n'
+          + 'INSTRUCTIONS: Apply the modification to the BASE content. Keep the same items/sentences/topics — only change what the user asked to change (formatting, length, tone, numbering, etc). Do NOT regenerate from scratch. Do NOT drift from the original task. Do NOT switch from sentences to definitions or vice versa unless explicitly asked.\n\n'
+          + 'Below are also draft attempts from other AI models that may already apply the edit correctly — use them as reference but the BASE above is the source of truth for content:\n\n'
+          + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
+      } else {
+        synthPrompt = 'The user asked: "' + prompt + '"\n\nBelow are draft answers to the question. Combine them into one final answer in your own voice. NEVER refer to "the responses", "the sources", "Response 1", "Response 2", etc. Just write the final answer.\n\n' + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
+      }
       const synthInst = buildSynthInstruction(successful.length, allRefusedM);
 
       if (wantsStream) {
@@ -1845,9 +1944,21 @@ export default async function handler(req, res) {
 
     const synthSources = scrubSourcesForSynthesis(successful);
     const allRefusedC = synthSources.every(s => s.wasRefusal);
-    const synthPrompt = allRefusedC
-      ? 'The user asked: "' + prompt + '"\n\nAll source AI responses were refusals. Ignore them. Answer the user\'s question yourself, completely and helpfully, using your own knowledge. Produce the actual deliverable they asked for.'
-      : 'The user asked: "' + prompt + '"\n\nBelow are draft answers to the question. Combine them into one final answer in your own voice. NEVER refer to "the responses", "the sources", "Response 1", "Response 2", etc. Just write the final answer.\n\n' + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
+    const editCtxC = detectEditRequest(prompt, convHistory);
+    let synthPrompt;
+    if (allRefusedC) {
+      synthPrompt = 'The user asked: "' + prompt + '"\n\nAll source AI responses were refusals. Ignore them. Answer the user\'s question yourself, completely and helpfully, using your own knowledge. Produce the actual deliverable they asked for.';
+    } else if (editCtxC) {
+      synthPrompt = 'EDIT MODE — The user is asking you to modify a previous response, not generate fresh content.\n\n'
+        + (editCtxC.originalTask ? 'ORIGINAL TASK (still applies — do not lose this constraint):\n' + editCtxC.originalTask + '\n\n' : '')
+        + 'PREVIOUS RESPONSE (this is the BASE CONTENT — preserve its substance, only apply the requested modification):\n═══ BASE ═══\n' + editCtxC.priorAssistant + '\n═══════════\n\n'
+        + 'USER\'S MODIFICATION REQUEST:\n"' + editCtxC.modificationRequest + '"\n\n'
+        + 'INSTRUCTIONS: Apply the modification to the BASE content. Keep the same items/sentences/topics — only change what the user asked to change (formatting, length, tone, numbering, etc). Do NOT regenerate from scratch. Do NOT drift from the original task. Do NOT switch from sentences to definitions or vice versa unless explicitly asked.\n\n'
+        + 'Below are also draft attempts from other AI models that may already apply the edit correctly — use them as reference but the BASE above is the source of truth for content:\n\n'
+        + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
+    } else {
+      synthPrompt = 'The user asked: "' + prompt + '"\n\nBelow are draft answers to the question. Combine them into one final answer in your own voice. NEVER refer to "the responses", "the sources", "Response 1", "Response 2", etc. Just write the final answer.\n\n' + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
+    }
     const synthInst = buildSynthInstruction(successful.length, allRefusedC);
 
     if (wantsStream) {
