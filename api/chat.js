@@ -1275,6 +1275,48 @@ export default async function handler(req, res) {
     });
   }
 
+  // ── Conversation context for the synthesizer ──
+  // The synth gets called with empty history (`[]`) to keep its system prompt
+  // tightly focused. But that means it loses awareness of what was just
+  // discussed. So when there IS prior conversation, we splice the last
+  // user/assistant exchange directly into the synth prompt as context.
+  //
+  // This catches cases like:
+  //   T1: "talk to me about adamax" → synth answers about the optimizer
+  //   T2: "search the internet for the peptide"
+  //
+  // Without prior context the synth sees only "search the internet for the
+  // peptide" and either asks "which peptide?" or invents details. With prior
+  // context it sees "we just discussed Adamax-the-optimizer; user now asking
+  // about the peptide version" and can answer accordingly.
+  //
+  // We trim the prior assistant message to keep token usage reasonable; the
+  // last ~500 chars give enough context without bloating the prompt.
+  function buildPriorContext(history) {
+    if (!Array.isArray(history) || history.length < 2) return '';
+    let priorUser = null;
+    let priorAssistant = null;
+    // Find the most recent user/assistant pair (right before the current turn).
+    // Note: history doesn't include the current user prompt yet.
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (!priorAssistant && history[i].role === 'assistant' && history[i].content) {
+        priorAssistant = history[i].content;
+      } else if (priorAssistant && !priorUser && history[i].role === 'user' && history[i].content) {
+        priorUser = history[i].content;
+        break;
+      }
+    }
+    if (!priorAssistant) return '';
+    const userPart = priorUser
+      ? 'Previous user message: "' + priorUser.slice(0, 400) + (priorUser.length > 400 ? '…' : '') + '"\n\n'
+      : '';
+    const assistantPart = 'Previous answer (last ~500 chars): "' + priorAssistant.slice(-500) + '"\n\n';
+    return '── PRIOR CONVERSATION CONTEXT ──\n'
+      + userPart
+      + assistantPart
+      + 'The current message may reference, follow up on, or pivot from the above. Use this context to interpret short or ambiguous follow-ups (e.g. if the user says "search for the peptide" after we discussed the algorithm version, they want the peptide interpretation now).\n──────────────\n\n';
+  }
+
   // ── Edit-mode detection ──
   // When the user's current message is a short modification request like
   // "make it shorter", "number them", "rewrite in X style", "no like Y",
@@ -1694,7 +1736,7 @@ export default async function handler(req, res) {
       const editCtxM = detectEditRequest(prompt, convHistory);
       let synthPrompt;
       if (allRefusedM) {
-        synthPrompt = 'The user asked: "' + prompt + '"\n\nAll source AI responses were refusals. Ignore them. Answer the user\'s question yourself, completely and helpfully, using your own knowledge. Produce the actual deliverable they asked for.';
+        synthPrompt = buildPriorContext(convHistory) + 'The user asked: "' + prompt + '"\n\nAll source AI responses were refusals. Ignore them. Answer the user\'s question yourself, completely and helpfully, using your own knowledge. Produce the actual deliverable they asked for.';
       } else if (editCtxM) {
         // Edit mode: the user wants to modify the prior assistant response.
         // Pass the prior content as the BASE and the modification request as
@@ -1709,7 +1751,8 @@ export default async function handler(req, res) {
           + 'Below are also draft attempts from other AI models that may already apply the edit correctly — use them as reference but the BASE above is the source of truth for content:\n\n'
           + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
       } else {
-        synthPrompt = 'The user asked: "' + prompt + '"\n\nBelow are draft answers to the question. Combine them into one final answer in your own voice. NEVER refer to "the responses", "the sources", "Response 1", "Response 2", etc. Just write the final answer.\n\n' + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
+        const priorCtxM = buildPriorContext(convHistory);
+        synthPrompt = priorCtxM + 'The user asked: "' + prompt + '"\n\nBelow are draft answers to the question. Combine them into one final answer in your own voice. NEVER refer to "the responses", "the sources", "Response 1", "Response 2", etc. Just write the final answer.\n\n' + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
       }
       const synthInst = buildSynthInstruction(successful.length, allRefusedM);
 
@@ -2075,7 +2118,7 @@ export default async function handler(req, res) {
     const editCtxC = detectEditRequest(prompt, convHistory);
     let synthPrompt;
     if (allRefusedC) {
-      synthPrompt = 'The user asked: "' + prompt + '"\n\nAll source AI responses were refusals. Ignore them. Answer the user\'s question yourself, completely and helpfully, using your own knowledge. Produce the actual deliverable they asked for.';
+      synthPrompt = buildPriorContext(convHistory) + 'The user asked: "' + prompt + '"\n\nAll source AI responses were refusals. Ignore them. Answer the user\'s question yourself, completely and helpfully, using your own knowledge. Produce the actual deliverable they asked for.';
     } else if (editCtxC) {
       synthPrompt = 'EDIT MODE — The user is asking you to modify a previous response, not generate fresh content.\n\n'
         + (editCtxC.originalTask ? 'ORIGINAL TASK (still applies — do not lose this constraint):\n' + editCtxC.originalTask + '\n\n' : '')
@@ -2085,7 +2128,8 @@ export default async function handler(req, res) {
         + 'Below are also draft attempts from other AI models that may already apply the edit correctly — use them as reference but the BASE above is the source of truth for content:\n\n'
         + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
     } else {
-      synthPrompt = 'The user asked: "' + prompt + '"\n\nBelow are draft answers to the question. Combine them into one final answer in your own voice. NEVER refer to "the responses", "the sources", "Response 1", "Response 2", etc. Just write the final answer.\n\n' + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
+      const priorCtxC = buildPriorContext(convHistory);
+      synthPrompt = priorCtxC + 'The user asked: "' + prompt + '"\n\nBelow are draft answers to the question. Combine them into one final answer in your own voice. NEVER refer to "the responses", "the sources", "Response 1", "Response 2", etc. Just write the final answer.\n\n' + synthSources.map(s => '═══ DRAFT ═══\n' + s.text).join('\n\n');
     }
     const synthInst = buildSynthInstruction(successful.length, allRefusedC);
 
