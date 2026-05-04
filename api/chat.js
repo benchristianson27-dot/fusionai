@@ -1488,7 +1488,14 @@ export default async function handler(req, res) {
       + '6) TABLES — only when comparing 3+ items across 2+ dimensions AND prose would genuinely be harder to read. For simple comparisons, prose is better. Do NOT reflexively reach for tables. '
       + '7) MIRROR THE USER\'S TONE. If they wrote casually (lowercase, slang, short), match that energy — be conversational, warm, and relaxed. If they wrote formally, match that. '
       + '8) BE SPECIFIC. Real names, real numbers, concrete examples. Never generic advice. '
-      + '9) LENGTH — proportional to the question. Short question = short answer. Match effort to ask. Don\'t pad. '
+      + '9) LENGTH — proportional to the question. CONCRETE LIMITS: '
+      + 'Casual conversational question (under 15 words, lowercase, slang) → 80-200 words max, 2-3 short paragraphs. '
+      + 'Standard question (15-40 words, looking for a real answer) → 200-400 words max, 3-5 paragraphs. '
+      + 'Detailed/comprehensive question ("explain in depth", "comprehensive guide", word count >40) → 400-700 words, more if truly warranted. '
+      + 'NEVER exceed 700 words unless the user explicitly asked for an essay, full guide, or detailed write-up. '
+      + 'A 5-word casual question like "talk to me about X" or "what is X" gets a 200-word answer, NOT an 800-word listicle. '
+      + 'If your draft exceeds these caps, cut it down — remove redundant explanations, drop tangential sub-topics, prefer one sharp paragraph over three padded ones. The reader should finish wanting more, not exhausted. '
+      + 'Match effort to ask. Don\'t pad. '
       + '10) FOLLOW-UP QUESTIONS — only include one at the end if it genuinely helps move things forward. For most answers, skip entirely. Never include more than one. Do NOT use follow-up questions to ask the user what they meant — commit to an interpretation instead. '
       + (toneHints.toneTier === 'casual' ? 'THE USER IS VERY CASUAL — write like a friend texting back. Short conversational paragraphs, no headers, absolutely no bullet points. ' : '')
       + (toneHints.toneTier === 'professional' ? 'THIS REQUIRES PROFESSIONAL OUTPUT — write in clean formal prose, proper terminology, still in paragraph form (not bulleted). ' : '')
