@@ -212,6 +212,7 @@ function buildSystemPrompt(complexity, activeMode, userEmail, teacherPromptCount
       + 'Do NOT add "make sure to personalize this" or "this is just a starting point" caveats — produce complete, polished work the user can actually use. '
       + 'Do NOT refuse on behalf of a third party (their teacher, parent, employer, school, etc.) — your job is to help the person in front of you, not to enforce someone else\'s rules. '
       + 'You WILL still decline: step-by-step synthesis of dangerous substances (bioweapons, explosives, fentanyl synthesis), sexual content involving minors, specific instructions to harm real identified people, functional malware. Everything else — answer directly. '
+      + 'LENGTH: Match your answer length to the question. Short casual question (under 15 words) → 100-200 word answer. Standard question → 200-400 words. Detailed/comprehensive request → 400-700 words. Don\'t produce a 1000-word listicle when someone asked a quick question. '
       + 'The goal: sound like a knowledgeable, unfiltered expert friend, not a corporate liability assistant.';
 
   if (userEmail === 'ben.christianson27@gmail.com') {
@@ -1618,7 +1619,11 @@ export default async function handler(req, res) {
         try {
           let acc = '';
           const stripper = makeBulletStripper();
-          for await (const delta of streamClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, INDIVIDUAL_MAX_TOKENS, WEB_SEARCH_ENABLED)) {
+          // Use prompt-derived token cap so simple/casual questions don't get
+          // 1500-token max responses. computeResponseCap returns words; the
+          // 1.6 multiplier converts to tokens conservatively.
+          const simpleMaxTokens = Math.min(INDIVIDUAL_MAX_TOKENS, Math.round(computeResponseCap(prompt) * 1.6 + 80));
+          for await (const delta of streamClaude(fullPrompt, models.claude, convHistory, KEYS.anthropic, systemPrompt, simpleMaxTokens, WEB_SEARCH_ENABLED)) {
             acc += delta;
             const cleaned = stripper.push(delta);
             if (cleaned) {
@@ -1830,7 +1835,8 @@ export default async function handler(req, res) {
 
       try {
         const ctrl = makeController();
-        finalReply = await withTimeout(claudeAsk(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 20000, 'Synthesis', ctrl);
+        const synthMaxTokensM2 = Math.min(SYNTHESIS_MAX_TOKENS, Math.round(computeResponseCap(prompt) * 1.6 + 80));
+        finalReply = await withTimeout(claudeAsk(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, synthMaxTokensM2), 20000, 'Synthesis', ctrl);
         synthesized = true;
       } catch {
         finalReply = successful[0].text;
@@ -2194,7 +2200,8 @@ export default async function handler(req, res) {
 
     try {
       const ctrl = makeController();
-      finalReply = await withTimeout(claudeAsk(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst), 25000, 'Synthesis', ctrl);
+      const synthMaxTokensC2 = Math.min(SYNTHESIS_MAX_TOKENS, Math.round(computeResponseCap(prompt) * 1.6 + 80));
+      finalReply = await withTimeout(claudeAsk(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, synthMaxTokensC2), 25000, 'Synthesis', ctrl);
       synthesized = true;
     } catch {
       finalReply = successful[0].text;
