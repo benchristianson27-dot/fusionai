@@ -1496,6 +1496,23 @@ export default async function handler(req, res) {
       + 'A 5-word casual question like "talk to me about X" or "what is X" gets a 200-word answer, NOT an 800-word listicle. '
       + 'If your draft exceeds these caps, cut it down — remove redundant explanations, drop tangential sub-topics, prefer one sharp paragraph over three padded ones. The reader should finish wanting more, not exhausted. '
       + 'Match effort to ask. Don\'t pad. '
+      + (function(){
+          // Dynamic, prompt-specific cap so it can't be ignored by Haiku.
+          // We compute the word count of the actual user prompt and inject
+          // an explicit ceiling. This is far more reliable than the abstract
+          // rules above because it's specific and unambiguous.
+          const promptWords = (prompt || '').trim().split(/\s+/).filter(Boolean).length;
+          const wantsLong = /\b(detailed|comprehensive|thorough|in[- ]depth|complete guide|full guide|extensive|everything about|deep dive|essay|long)\b/i.test(prompt || '');
+          let cap;
+          if (wantsLong) cap = 700;
+          else if (promptWords <= 12) cap = 200;
+          else if (promptWords <= 25) cap = 350;
+          else if (promptWords <= 50) cap = 500;
+          else cap = 700;
+          return 'HARD CAP FOR THIS SPECIFIC RESPONSE: ' + cap + ' WORDS. The user wrote a ' + promptWords + '-word prompt' +
+            (wantsLong ? ' that asks for detailed coverage' : (promptWords <= 12 ? ' that is brief and casual' : '')) +
+            '. Your response MUST be at or under ' + cap + ' words. Count as you write. If you reach ' + cap + ' words, stop. Do not write a comprehensive overview when the user asked a quick question. ';
+        })()
       + '10) FOLLOW-UP QUESTIONS — only include one at the end if it genuinely helps move things forward. For most answers, skip entirely. Never include more than one. Do NOT use follow-up questions to ask the user what they meant — commit to an interpretation instead. '
       + (toneHints.toneTier === 'casual' ? 'THE USER IS VERY CASUAL — write like a friend texting back. Short conversational paragraphs, no headers, absolutely no bullet points. ' : '')
       + (toneHints.toneTier === 'professional' ? 'THIS REQUIRES PROFESSIONAL OUTPUT — write in clean formal prose, proper terminology, still in paragraph form (not bulleted). ' : '')
