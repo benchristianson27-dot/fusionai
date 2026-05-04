@@ -1448,6 +1448,20 @@ export default async function handler(req, res) {
     return out || text; // never return empty — fall back to original if everything got cut
   }
 
+  // Compute the hard word cap for the response based on prompt length + intent.
+  // Used both inside the synth instruction text AND to set max_tokens on the
+  // model call so even if the model ignores the rule, the API will cut it off.
+  function computeResponseCap(p) {
+    const promptWords = (p || '').trim().split(/\s+/).filter(Boolean).length;
+    const wantsLong = /\b(detailed|comprehensive|thorough|in[- ]depth|complete guide|full guide|extensive|everything about|deep dive|essay|long)\b/i.test(p || '');
+    if (wantsLong) return 600;
+    if (promptWords <= 8) return 150;
+    if (promptWords <= 15) return 220;
+    if (promptWords <= 30) return 350;
+    if (promptWords <= 60) return 500;
+    return 700;
+  }
+
   function buildSynthInstruction(successfulCount, allRefused) {
     const toneHints = analyzeTone(prompt);
     // Override mode: every source response was a refusal lecture. Tell the
@@ -1462,8 +1476,16 @@ export default async function handler(req, res) {
         + 'Write in flowing paragraphs (no bullet points), match the user\'s tone, and produce the actual deliverable they asked for. '
         + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
     }
-    // Generic example (was supplement-themed and primed Haiku off-topic).
-    const base = 'You are the FusionAI synthesis engine. Create one clear, well-written answer from the AI responses provided. '
+    // Compute the response cap (also used to set max_tokens below).
+    const hardCap = computeResponseCap(prompt);
+    const promptWordsX = (prompt || '').trim().split(/\s+/).filter(Boolean).length;
+    const capPreamble = '⚠️ HARD WORD LIMIT: ' + hardCap + ' WORDS MAXIMUM. '
+      + 'The user wrote a ' + promptWordsX + '-word prompt. Your response MUST be at or under ' + hardCap + ' words. '
+      + 'This is a HARD ceiling, not a guideline. If you reach ' + hardCap + ' words, stop writing — even mid-thought if needed. '
+      + 'Do NOT produce a comprehensive guide for a casual question. Do NOT pad. Do NOT cover every angle. Cover the main point, briefly, and stop. '
+      + 'Cut tangential content. Cut filler. Cut ramp-up. ';
+    const base = capPreamble
+      + 'You are the FusionAI synthesis engine. Create one clear, well-written answer from the AI responses provided. '
       + 'CRITICAL RULES: '
       + '1) NEVER mention that multiple AIs contributed, never mention synthesis, never mention models. Write as one voice. '
       + '2) NEVER META-COMMENTATE. Do NOT say "these responses are talking about different things" or "there\'s been a mix-up" or "the sources disagree." '
@@ -1489,30 +1511,10 @@ export default async function handler(req, res) {
       + '7) MIRROR THE USER\'S TONE. If they wrote casually (lowercase, slang, short), match that energy — be conversational, warm, and relaxed. If they wrote formally, match that. '
       + '8) BE SPECIFIC. Real names, real numbers, concrete examples. Never generic advice. '
       + '9) LENGTH — proportional to the question. CONCRETE LIMITS: '
-      + 'Casual conversational question (under 15 words, lowercase, slang) → 80-200 words max, 2-3 short paragraphs. '
-      + 'Standard question (15-40 words, looking for a real answer) → 200-400 words max, 3-5 paragraphs. '
-      + 'Detailed/comprehensive question ("explain in depth", "comprehensive guide", word count >40) → 400-700 words, more if truly warranted. '
-      + 'NEVER exceed 700 words unless the user explicitly asked for an essay, full guide, or detailed write-up. '
-      + 'A 5-word casual question like "talk to me about X" or "what is X" gets a 200-word answer, NOT an 800-word listicle. '
-      + 'If your draft exceeds these caps, cut it down — remove redundant explanations, drop tangential sub-topics, prefer one sharp paragraph over three padded ones. The reader should finish wanting more, not exhausted. '
+      + 'A 5-word casual question gets a brief, focused answer — NOT an 800-word listicle. '
+      + 'If your draft exceeds the cap stated at the top, cut it down — remove redundant explanations, drop tangential sub-topics, prefer one sharp paragraph over three padded ones. The reader should finish wanting more, not exhausted. '
       + 'Match effort to ask. Don\'t pad. '
-      + (function(){
-          // Dynamic, prompt-specific cap so it can't be ignored by Haiku.
-          // We compute the word count of the actual user prompt and inject
-          // an explicit ceiling. This is far more reliable than the abstract
-          // rules above because it's specific and unambiguous.
-          const promptWords = (prompt || '').trim().split(/\s+/).filter(Boolean).length;
-          const wantsLong = /\b(detailed|comprehensive|thorough|in[- ]depth|complete guide|full guide|extensive|everything about|deep dive|essay|long)\b/i.test(prompt || '');
-          let cap;
-          if (wantsLong) cap = 700;
-          else if (promptWords <= 12) cap = 200;
-          else if (promptWords <= 25) cap = 350;
-          else if (promptWords <= 50) cap = 500;
-          else cap = 700;
-          return 'HARD CAP FOR THIS SPECIFIC RESPONSE: ' + cap + ' WORDS. The user wrote a ' + promptWords + '-word prompt' +
-            (wantsLong ? ' that asks for detailed coverage' : (promptWords <= 12 ? ' that is brief and casual' : '')) +
-            '. Your response MUST be at or under ' + cap + ' words. Count as you write. If you reach ' + cap + ' words, stop. Do not write a comprehensive overview when the user asked a quick question. ';
-        })()
+      + 'REMEMBER THE CAP: this response must stay at or under ' + hardCap + ' words. '
       + '10) FOLLOW-UP QUESTIONS — only include one at the end if it genuinely helps move things forward. For most answers, skip entirely. Never include more than one. Do NOT use follow-up questions to ask the user what they meant — commit to an interpretation instead. '
       + (toneHints.toneTier === 'casual' ? 'THE USER IS VERY CASUAL — write like a friend texting back. Short conversational paragraphs, no headers, absolutely no bullet points. ' : '')
       + (toneHints.toneTier === 'professional' ? 'THIS REQUIRES PROFESSIONAL OUTPUT — write in clean formal prose, proper terminology, still in paragraph form (not bulleted). ' : '')
@@ -1785,7 +1787,10 @@ export default async function handler(req, res) {
         try {
           let acc = '';
           const stripper = makeBulletStripper();
-          for await (const delta of streamClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, SYNTHESIS_MAX_TOKENS)) {
+          // Token cap derived from the same word cap shown in the prompt.
+          // Even if the model ignores the rule, the API stops it at the cap.
+          const synthMaxTokensM = Math.min(SYNTHESIS_MAX_TOKENS, Math.round(computeResponseCap(prompt) * 1.6 + 80));
+          for await (const delta of streamClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, synthMaxTokensM)) {
             acc += delta;
             const cleaned = stripper.push(delta);
             if (cleaned) sendEvent('delta', { text: cleaned });
@@ -2162,7 +2167,8 @@ export default async function handler(req, res) {
       try {
         let acc = '';
         const stripper = makeBulletStripper();
-        for await (const delta of streamClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, SYNTHESIS_MAX_TOKENS)) {
+        const synthMaxTokensC = Math.min(SYNTHESIS_MAX_TOKENS, Math.round(computeResponseCap(prompt) * 1.6 + 80));
+        for await (const delta of streamClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, synthMaxTokensC)) {
           acc += delta;
           const cleaned = stripper.push(delta);
           if (cleaned) sendEvent('delta', { text: cleaned });
