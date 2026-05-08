@@ -362,9 +362,16 @@ export default async function handler(req, res) {
 
   const TIER_MODELS = {
     free: { claude: 'claude-haiku-4-5-20251001', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash', grok: 'grok-4-1-fast-non-reasoning' },
-    starter: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash', grok: 'grok-4-1-fast-non-reasoning' },
-    pro: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.5-flash', grok: 'grok-4-1-fast' },
-    enterprise: { claude: 'claude-sonnet-4-20250514', openai: 'gpt-4o', gemini: 'gemini-2.5-flash', grok: 'grok-4-1-fast' },
+    // Starter: bumped from Sonnet 4 → Sonnet 4.6 (current mid-tier flagship,
+    // released Feb 2026, $3/$15 per 1M tokens — same price as Sonnet 4 but
+    // significantly better on coding, agents, and long-context reasoning).
+    starter: { claude: 'claude-sonnet-4-6', openai: 'gpt-4o-mini', gemini: 'gemini-2.5-flash', grok: 'grok-4-1-fast-non-reasoning' },
+    // Pro: bumped from Sonnet 4 → Opus 4.7 (Anthropic's actual flagship,
+    // April 2026, $5/$25 per 1M tokens). Real differentiation from Starter.
+    // Cost per Pro prompt rises from ~$0.030 to ~$0.040 — still healthy
+    // margin at $75/mo with 1500 prompt allowance.
+    pro: { claude: 'claude-opus-4-7', openai: 'gpt-4o', gemini: 'gemini-2.5-flash', grok: 'grok-4-1-fast' },
+    enterprise: { claude: 'claude-opus-4-7', openai: 'gpt-4o', gemini: 'gemini-2.5-flash', grok: 'grok-4-1-fast' },
   };
 
   const models = TIER_MODELS[tier] || TIER_MODELS.free;
@@ -1455,6 +1462,14 @@ export default async function handler(req, res) {
   function computeResponseCap(p) {
     const promptWords = (p || '').trim().split(/\s+/).filter(Boolean).length;
     const wantsLong = /\b(detailed|comprehensive|thorough|in[- ]depth|complete guide|full guide|extensive|everything about|deep dive|essay|long)\b/i.test(p || '');
+    // Deep-research / study-aid intent: user wants the model to consolidate
+    // a lot of source material into a study deliverable (note card, cheat
+    // sheet, study guide, review sheet, summary of an entire course). For
+    // these we lift the cap meaningfully — they need room to actually pack
+    // the content the user asked for.
+    const wantsStudyDeliverable = /\b(note\s*card|cheat\s*sheet|study\s*guide|review\s*sheet|exam\s*review|test\s*review|prep\s*sheet|crib\s*sheet|reference\s*sheet|formula\s*sheet)\b/i.test(p || '');
+    const wantsCourseDeepDive = /\b(go\s+(thru|through)\s+(my\s+)?(entire|whole|all)|everything\s+(we|i)\s+(covered|learned|studied)|find\s+(what|everything|all)\s+(should|i\s+need|to\s+(study|know|put|write)))/i.test(p || '');
+    if (wantsStudyDeliverable || wantsCourseDeepDive) return 1200;
     if (wantsLong) return 600;
     if (promptWords <= 8) return 150;
     if (promptWords <= 15) return 220;
