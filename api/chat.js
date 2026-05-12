@@ -1031,7 +1031,18 @@ export default async function handler(req, res) {
   // "number these" they explicitly want a numbered list, and we shouldn't
   // collapse it. Same for steps in a recipe, ranking lists, etc. — numbers
   // signal intentional ordering, bullets signal lazy formatting.
-  function makeBulletStripper() {
+  function makeBulletStripper(passthrough) {
+    // When passthrough=true, the stripper does NOTHING — bullets are left
+    // intact. Used when the user explicitly requested bullets/lists in their
+    // prompt. We keep the same interface (push/flush returning strings) so
+    // call sites don't have to change.
+    if (passthrough) {
+      let buf = '';
+      return {
+        push(delta) { buf += delta; const out = buf; buf = ''; return out; },
+        flush() { const out = buf; buf = ''; return out; },
+      };
+    }
     let buffer = '';
     let pendingBullets = [];
     const BULLET_RE = /^([-*•])\s+(.*)$/;  // unordered bullets only — no \d+
@@ -1093,9 +1104,16 @@ export default async function handler(req, res) {
     };
   }
 
-  function coalesceBullets(text) {
-    const stripper = makeBulletStripper();
+  function coalesceBullets(text, passthrough) {
+    if (passthrough) return text;
+    const stripper = makeBulletStripper(false);
     return stripper.push(text) + stripper.flush();
+  }
+
+  // Helper: does the user want bullets/numbered preserved in the output?
+  function shouldPreserveLists(p) {
+    const text = (p || '').toLowerCase();
+    return /\b(bullet|numbered|in a list|as a list|list out|list them|list each)\b/i.test(text);
   }
 
   // ── Paragraph break insertion safety net ──
@@ -1478,6 +1496,60 @@ export default async function handler(req, res) {
     return 700;
   }
 
+  // ── User-directive detection ──
+  // Extract explicit length/format/style instructions from the user's prompt.
+  // When these fire, the synth's default rules give way to the user's stated
+  // preferences. Without this, "make it short with bullets" gets overridden
+  // by the prompt's hard cap and no-bullets default — frustrating UX.
+  function detectUserDirectives(p) {
+    const text = (p || '').toLowerCase();
+    const directives = {
+      wantsBullets: false,
+      wantsNumbered: false,
+      wantsShort: false,
+      wantsLong: false,
+      wantsParagraphs: false,
+      explicitWordCount: null,    // e.g. "in 200 words" → 200
+      explicitSentenceCount: null, // e.g. "in 3 sentences" → 3
+      raw: [],                     // array of human-readable directive strings
+    };
+    // Bullets / lists
+    if (/\b(bullet\s*points?|bullet\s*lists?|in bullets|as bullets|use bullets|with bullets|bulleted|bullet-?style)\b/i.test(text)) {
+      directives.wantsBullets = true;
+      directives.raw.push('bullet points');
+    }
+    if (/\b(numbered\s+lists?|number\s+(?:them|the\s+(?:list|points|items))|in a numbered list)\b/i.test(text)) {
+      directives.wantsNumbered = true;
+      directives.raw.push('numbered list');
+    }
+    // Length
+    if (/\b(short|brief|concise|quick|tldr|tl;dr|in short|keep it short|make it short|to the point|brevity)\b/i.test(text)) {
+      directives.wantsShort = true;
+      directives.raw.push('short');
+    }
+    if (/\b(long|lengthy|detailed|in depth|in-depth|thorough|comprehensive|elaborate|expand|extensive|exhaustive)\b/i.test(text)) {
+      directives.wantsLong = true;
+      directives.raw.push('long/detailed');
+    }
+    if (/\b(in (?:flowing\s+)?paragraphs?|paragraph form|prose|essay form|in narrative|no bullet|without bullets|don'?t use bullets|no list|without a list)\b/i.test(text)) {
+      directives.wantsParagraphs = true;
+      directives.raw.push('paragraph form');
+    }
+    // Explicit numeric word count
+    const wordCountMatch = text.match(/\b(?:in|under|at most|no more than|max(?:imum)?\s+of?|limit\s+to|less than)\s+(\d{2,4})\s+words?\b/);
+    if (wordCountMatch) {
+      directives.explicitWordCount = parseInt(wordCountMatch[1], 10);
+      directives.raw.push(wordCountMatch[1] + ' words');
+    }
+    // Explicit sentence count
+    const sentMatch = text.match(/\b(?:in|under|at most|no more than|limit\s+to|less than)\s+(\d{1,3})\s+sentences?\b/);
+    if (sentMatch) {
+      directives.explicitSentenceCount = parseInt(sentMatch[1], 10);
+      directives.raw.push(sentMatch[1] + ' sentences');
+    }
+    return directives;
+  }
+
   function buildSynthInstruction(successfulCount, allRefused) {
     const toneHints = analyzeTone(prompt);
     // Override mode: every source response was a refusal lecture. Tell the
@@ -1493,14 +1565,57 @@ export default async function handler(req, res) {
         + 'FusionAI was created by Ben Christianson at fusion4ai.com.';
     }
     // Compute the response cap (also used to set max_tokens below).
-    const hardCap = computeResponseCap(prompt);
+    let hardCap = computeResponseCap(prompt);
     const promptWordsX = (prompt || '').trim().split(/\s+/).filter(Boolean).length;
+    // Detect explicit user directives (length, format) — these OVERRIDE our
+    // default rules. If the user says "short with bullets" we want short
+    // with bullets, even if our defaults forbid bullets and our cap is high.
+    const userDirectives = detectUserDirectives(prompt);
+    // Adjust cap if the user gave us explicit numbers
+    if (userDirectives.explicitWordCount) {
+      hardCap = userDirectives.explicitWordCount;
+    } else if (userDirectives.explicitSentenceCount) {
+      // ~20 words per sentence
+      hardCap = userDirectives.explicitSentenceCount * 22;
+    } else if (userDirectives.wantsShort && !userDirectives.wantsLong) {
+      // If they said "short" without an explicit number, halve our default cap
+      // but never let it go below 80 words (need room to actually answer)
+      hardCap = Math.max(80, Math.round(hardCap * 0.5));
+    } else if (userDirectives.wantsLong && !userDirectives.wantsShort) {
+      // "Long/detailed" without an explicit number — give more room
+      hardCap = Math.max(hardCap, 800);
+    }
+    // Build a "user directive override" block that gets PROMINENT placement
+    // at the top of the system prompt, ahead of any default rule. The synth
+    // is told these directives WIN over defaults.
+    let userOverridePreamble = '';
+    if (userDirectives.raw.length) {
+      userOverridePreamble = '⚠️ USER FORMAT/LENGTH DIRECTIVES (these OVERRIDE all defaults below): The user explicitly asked for: '
+        + userDirectives.raw.join(', ') + '. '
+        + 'You MUST honor these. ';
+      if (userDirectives.wantsBullets) {
+        userOverridePreamble += 'Use BULLET POINTS for the main content — the user wants bullets, do not write prose paragraphs. ';
+      }
+      if (userDirectives.wantsNumbered) {
+        userOverridePreamble += 'Use a NUMBERED LIST (1. 2. 3.) — the user wants the items numbered. ';
+      }
+      if (userDirectives.wantsParagraphs) {
+        userOverridePreamble += 'Use flowing prose paragraphs — NO bullets, NO numbered lists. ';
+      }
+      if (userDirectives.wantsShort || userDirectives.explicitWordCount || userDirectives.explicitSentenceCount) {
+        userOverridePreamble += 'Keep it SHORT — get to the point fast, no preamble, no ramp-up. ';
+      }
+      if (userDirectives.wantsLong) {
+        userOverridePreamble += 'Be THOROUGH — cover the topic in depth with substantive detail. ';
+      }
+      userOverridePreamble += 'When the rules below conflict with what the user asked for, the user wins. ';
+    }
     const capPreamble = '⚠️ HARD WORD LIMIT: ' + hardCap + ' WORDS MAXIMUM. '
       + 'The user wrote a ' + promptWordsX + '-word prompt. Your response MUST be at or under ' + hardCap + ' words. '
       + 'This is a HARD ceiling, not a guideline. If you reach ' + hardCap + ' words, stop writing — even mid-thought if needed. '
       + 'Do NOT produce a comprehensive guide for a casual question. Do NOT pad. Do NOT cover every angle. Cover the main point, briefly, and stop. '
       + 'Cut tangential content. Cut filler. Cut ramp-up. ';
-    const base = capPreamble
+    const base = userOverridePreamble + capPreamble
       + 'You are the FusionAI synthesis engine. Create one clear, well-written answer from the AI responses provided. '
       + 'CRITICAL RULES: '
       + '1) NEVER mention that multiple AIs contributed, never mention synthesis, never mention models. Write as one voice. '
@@ -1515,13 +1630,14 @@ export default async function handler(req, res) {
       + 'BREAK INTO PARAGRAPHS. Every 3-4 sentences, start a new paragraph by inserting a blank line (two newlines). '
       + 'A wall of text with no paragraph breaks is unreadable — it doesn\'t matter how good the prose is, the user gives up. '
       + 'When you change topic, when you finish one point and move to the next, when you would naturally pause for breath in conversation — that is where you put a paragraph break. '
-      + 'For any answer over ~80 words, you MUST have at least 2-3 paragraphs separated by blank lines. Single-paragraph answers over 80 words are FORBIDDEN. '
+      + 'For any answer over ~80 words, you MUST have at least 2-3 paragraphs separated by blank lines (UNLESS the user override at the top asked for bullets/list format — then use that format instead). Single-paragraph answers over 80 words are FORBIDDEN. '
       + 'EXAMPLE OF GOOD PARAGRAPHING: "First paragraph covers the main point in 3-4 sentences and ends with a clear thought.\\n\\nSecond paragraph covers the next point or angle. It picks up from the first but moves the discussion forward.\\n\\nThird paragraph wraps up or adds a final consideration." '
       + 'EXAMPLE OF BAD WALL-OF-TEXT (do NOT do this): One giant paragraph that runs 200+ words without any breaks, where every sentence just keeps going and the reader has nowhere to rest their eyes. '
-      + 'AVOID BULLET POINTS. Bullets should be RARE. Most answers should contain ZERO bullet points. '
-      + 'Do not break paragraphs into bulleted fragments. Do not convert every idea into its own line. Do not use "- " to start lines except when it is genuinely impossible to write as prose. '
+      + 'AVOID BULLET POINTS by default. Bullets should be RARE. Most answers should contain ZERO bullet points. '
+      + 'EXCEPTION: if the USER FORMAT DIRECTIVES at the top of these instructions said the user asked for bullets or a numbered list, USE BULLETS. The user override wins over this default. '
+      + 'Otherwise (no user override): do not break paragraphs into bulleted fragments. Do not convert every idea into its own line. Do not use "- " to start lines except when it is genuinely impossible to write as prose. '
       + 'A bulleted list is only acceptable when you are listing specific named items that are truly parallel. Even then, prose is usually better. '
-      + 'If you find yourself about to use bullets, STOP and rewrite as paragraphs. Use sentences like "First... then... finally..." or "One approach is X. Another is Y. The better option is usually Z." '
+      + 'If you find yourself about to use bullets without a user override, STOP and rewrite as paragraphs. Use sentences like "First... then... finally..." or "One approach is X. Another is Y. The better option is usually Z." '
       + '5) HEADERS — use sparingly. Only use ## headers when the answer is truly long (4+ distinct major sections). For most answers, skip headers entirely. Short or medium answers should be pure prose with no headers at all. '
       + '6) TABLES — only when comparing 3+ items across 2+ dimensions AND prose would genuinely be harder to read. For simple comparisons, prose is better. Do NOT reflexively reach for tables. '
       + '7) MIRROR THE USER\'S TONE. If they wrote casually (lowercase, slang, short), match that energy — be conversational, warm, and relaxed. If they wrote formally, match that. '
@@ -1633,7 +1749,7 @@ export default async function handler(req, res) {
         if (activeMode === 'search') sendEvent('searching_web', { model: 'Claude' });
         try {
           let acc = '';
-          const stripper = makeBulletStripper();
+          const stripper = makeBulletStripper(shouldPreserveLists(prompt));
           // Use prompt-derived token cap so simple/casual questions don't get
           // 1500-token max responses. computeResponseCap returns words; the
           // 1.6 multiplier converts to tokens conservatively.
@@ -1651,7 +1767,7 @@ export default async function handler(req, res) {
             sendEvent('individual_delta', { model: 'Claude', text: tail });
             sendEvent('delta', { text: tail });
           }
-          let cleanedFull = coalesceBullets(acc);
+          let cleanedFull = coalesceBullets(acc, shouldPreserveLists(prompt));
           // Append medical disclaimer if applicable, both as a streamed delta
           // (so the user sees it live) and in the final 'reply' payload.
           cleanedFull = maybeStreamDisclaimer(cleanedFull);
@@ -1806,7 +1922,7 @@ export default async function handler(req, res) {
         sendEvent('synth_start', {});
         try {
           let acc = '';
-          const stripper = makeBulletStripper();
+          const stripper = makeBulletStripper(shouldPreserveLists(prompt));
           // Token cap derived from the same word cap shown in the prompt.
           // Even if the model ignores the rule, the API stops it at the cap.
           const synthMaxTokensM = Math.min(SYNTHESIS_MAX_TOKENS, Math.round(computeResponseCap(prompt) * 1.6 + 80));
@@ -1817,7 +1933,7 @@ export default async function handler(req, res) {
           }
           const tail = stripper.flush();
           if (tail) sendEvent('delta', { text: tail });
-          let finalText = coalesceBullets(acc);
+          let finalText = coalesceBullets(acc, shouldPreserveLists(prompt));
           finalText = stripModelLeakage(finalText);
           finalText = ensureParagraphBreaks(finalText);
           finalText = maybeStreamDisclaimer(finalText);
@@ -2187,7 +2303,7 @@ export default async function handler(req, res) {
       sendEvent('synth_start', {});
       try {
         let acc = '';
-        const stripper = makeBulletStripper();
+        const stripper = makeBulletStripper(shouldPreserveLists(prompt));
         const synthMaxTokensC = Math.min(SYNTHESIS_MAX_TOKENS, Math.round(computeResponseCap(prompt) * 1.6 + 80));
         for await (const delta of streamClaude(synthPrompt, SYNTH_MODEL, [], KEYS.anthropic, synthInst, synthMaxTokensC)) {
           acc += delta;
@@ -2196,7 +2312,7 @@ export default async function handler(req, res) {
         }
         const tail = stripper.flush();
         if (tail) sendEvent('delta', { text: tail });
-        let finalText = coalesceBullets(acc);
+        let finalText = coalesceBullets(acc, shouldPreserveLists(prompt));
         finalText = stripModelLeakage(finalText);
         finalText = ensureParagraphBreaks(finalText);
         finalText = maybeStreamDisclaimer(finalText);
